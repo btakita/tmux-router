@@ -6,7 +6,7 @@ Add tmux-router to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-tmux-router = "0.2"
+tmux-router = "0.1"
 ```
 
 ## Basic Usage
