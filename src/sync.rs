@@ -244,6 +244,15 @@ pub fn find_best_window(
 // Public API
 // =========================================================================
 
+/// Result of a successful sync operation.
+#[derive(Debug, Clone)]
+pub struct SyncResult {
+    /// The tmux session that owns the target window (None if undetermined).
+    pub target_session: Option<String>,
+    /// The tmux window ID where panes were arranged.
+    pub target_window: String,
+}
+
 /// Sync editor layout to tmux panes.
 ///
 /// `col_args` are comma-separated file lists (one per column).
@@ -259,7 +268,7 @@ pub fn sync(
     tmux: &Tmux,
     registry_path: &Path,
     resolve_file: &dyn Fn(&Path) -> Option<FileResolution>,
-) -> Result<()> {
+) -> Result<SyncResult> {
     let layout = Layout::parse(col_args)?;
     let all_files = layout.all_files();
 
@@ -298,11 +307,11 @@ pub fn sync(
             }
             FileResolution::Registered { key, tmux_session } => {
                 // Collect tmux_session from first doc that has it
-                if doc_tmux_session.is_none() {
-                    if let Some(ref ts) = tmux_session {
-                        doc_tmux_session = Some(ts.clone());
-                        eprintln!("tmux_session={} (from {})", ts, file.display());
-                    }
+                if doc_tmux_session.is_none()
+                    && let Some(ref ts) = tmux_session
+                {
+                    doc_tmux_session = Some(ts.clone());
+                    eprintln!("tmux_session={} (from {})", ts, file.display());
                 }
 
                 match registry::lookup(registry_path, &key)? {
@@ -361,12 +370,23 @@ pub fn sync(
         }
     }
 
+    // Helper: build an early SyncResult from the first resolved pane.
+    let early_result = |tmux: &Tmux| -> SyncResult {
+        let win = resolved.first()
+            .and_then(|r| tmux.pane_window(&r.pane_id).ok())
+            .unwrap_or_default();
+        SyncResult {
+            target_session: doc_tmux_session.clone(),
+            target_window: win,
+        }
+    };
+
     // Single file without --window: just focus.
     if all_files.len() == 1 && window.is_none() {
         if let Some(r) = resolved.first() {
             tmux.select_pane(&r.pane_id)?;
         }
-        return Ok(());
+        return Ok(early_result(tmux));
     }
 
     if resolved.len() < 2 {
@@ -383,7 +403,7 @@ pub fn sync(
         } else if let Some(r) = resolved.first() {
             tmux.select_pane(&r.pane_id)?;
         }
-        return Ok(());
+        return Ok(early_result(tmux));
     }
 
     // --- Phase 3: Build the 2D column structure with resolved panes ---
@@ -412,7 +432,7 @@ pub fn sync(
     }
     if pane_columns.len() == 1 && pane_columns[0].len() == 1 {
         tmux.select_pane(&pane_columns[0][0])?;
-        return Ok(());
+        return Ok(early_result(tmux));
     }
 
     // Collect the full set of wanted pane IDs
@@ -516,7 +536,10 @@ pub fn sync(
             pane_columns.len()
         );
     }
-    Ok(())
+    Ok(SyncResult {
+        target_session,
+        target_window,
+    })
 }
 
 // =========================================================================

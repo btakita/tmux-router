@@ -1,0 +1,9 @@
+[book]
+title = "tmux-router"
+description = "Declarative tmux pane routing — sync editor layouts to tmux"
+authors = ["Brian Takita"]
+language = "en"
+src = "docs"
+
+[output.html]
+git-repository-url = "https://github.com/btakita/tmux-router"
