@@ -80,3 +80,47 @@ pub fn prune_dead(registry: &Registry, tmux: &Tmux) -> Registry {
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
+
+/// Prune dead panes and deduplicate entries from the registry file.
+///
+/// 1. Removes entries whose tmux panes are no longer alive.
+/// 2. Deduplicates entries pointing to the same pane (keeps most recent by `started` timestamp).
+/// 3. Saves if anything changed.
+///
+/// Returns the number of entries removed.
+pub fn prune(registry_path: &Path, tmux: &Tmux) -> Result<usize> {
+    let mut registry = load_registry(registry_path)?;
+    let before = registry.len();
+
+    // Remove dead panes
+    registry.retain(|_key, entry| tmux.pane_alive(&entry.pane));
+    let dead_removed = before - registry.len();
+
+    // Deduplicate: if multiple keys point to the same pane, keep most recent
+    let mut pane_to_keys: std::collections::HashMap<String, Vec<(String, String)>> =
+        std::collections::HashMap::new();
+    for (key, entry) in &registry {
+        pane_to_keys
+            .entry(entry.pane.clone())
+            .or_default()
+            .push((key.clone(), entry.started.clone()));
+    }
+    let mut dedup_removed = 0usize;
+    for (_pane, mut keys) in pane_to_keys {
+        if keys.len() <= 1 {
+            continue;
+        }
+        // Sort by started timestamp descending — keep the newest
+        keys.sort_by(|a, b| b.1.cmp(&a.1));
+        for (key, _) in &keys[1..] {
+            registry.remove(key);
+            dedup_removed += 1;
+        }
+    }
+
+    let total = dead_removed + dedup_removed;
+    if total > 0 {
+        save_registry(registry_path, &registry)?;
+    }
+    Ok(total)
+}
