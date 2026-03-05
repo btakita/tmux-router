@@ -2432,4 +2432,55 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_reconcile_stash_full_falls_back_to_break() {
+        // Bug reproduction: when the stash window is too small to accept more
+        // panes (tmux "pane too small" error), reconcile should fall back to
+        // break_pane instead of leaving unwanted panes in the target window.
+        let t = IsolatedTmux::new("sync-test-stash-full");
+        let tmp = TempDir::new().unwrap();
+
+        // Create 4 panes in separate windows
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "10"]);
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+        let pane_c = t.new_window("test", tmp.path()).unwrap();
+        let pane_d = t.new_window("test", tmp.path()).unwrap();
+
+        // First sync: bring all 4 panes into target window
+        let cols_all = vec![
+            vec![pane_a.clone()],
+            vec![pane_b.clone()],
+            vec![pane_c.clone()],
+            vec![pane_d.clone()],
+        ];
+        let desired_all: Vec<&str> = vec![&pane_a, &pane_b, &pane_c, &pane_d];
+        let log1 = reconcile(&t, &target_window, &cols_all, &desired_all, Some("test"), None, &dummy_registry_path()).unwrap();
+        assert!(!log1.has_errors(), "sync1 errors: {:?}", log1.entries());
+
+        // Pre-fill the stash window with extra panes to make it cramped.
+        // The stash window starts at minimum height; adding panes shrinks each row.
+        let stash_window = t.ensure_stash_window("test").unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &stash_window, "-y", "4"]);
+        for _ in 0..3 {
+            let _ = t.raw_cmd(&["split-window", "-t", &stash_window, "-dv"]);
+        }
+
+        // Second sync: only keep A and B, evict C and D.
+        // With a cramped stash window, stash_pane's join may fail —
+        // the fix should fall back to break_pane.
+        let cols_ab = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired_ab: Vec<&str> = vec![&pane_a, &pane_b];
+        let log2 = reconcile(&t, &target_window, &cols_ab, &desired_ab, Some("test"), None, &dummy_registry_path()).unwrap();
+
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(final_panes.len(), 2, "should have exactly A and B, got: {:?}", final_panes);
+        assert!(final_panes.contains(&pane_a), "A in target");
+        assert!(final_panes.contains(&pane_b), "B in target");
+        assert!(t.pane_alive(&pane_c), "C still alive (stashed or broken out)");
+        assert!(t.pane_alive(&pane_d), "D still alive (stashed or broken out)");
+        assert!(!log2.has_errors(), "sync2 errors: {:?}", log2.entries());
+    }
 }

@@ -454,8 +454,18 @@ impl Tmux {
         };
         let stash_panes = self.list_window_panes(&stash_window).unwrap_or_default();
         if let Some(target) = stash_panes.first() {
-            // Use -dv: -d prevents changing the active pane, -v stacks vertically
-            self.join_pane(pane_id, target, "-dv")
+            // Resize stash window tall enough to accept another pane.
+            // tmux enforces a minimum per-pane height that varies by content,
+            // so use a generous fixed size. The stash window is never displayed.
+            let _ = self.raw_cmd(&[
+                "resize-window", "-t", &stash_window, "-y", "200",
+            ]);
+            // Use -dv: -d prevents changing the active pane, -v stacks vertically.
+            // Fall back to break_pane if join still fails.
+            match self.join_pane(pane_id, target, "-dv") {
+                Ok(()) => Ok(()),
+                Err(_) => self.break_pane(pane_id),
+            }
         } else {
             // Empty stash window shouldn't happen (new-window creates a shell pane),
             // but fall back to break_pane just in case.
