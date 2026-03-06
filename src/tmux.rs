@@ -621,6 +621,45 @@ impl Tmux {
         }
     }
 
+    /// Capture pane content (what's visible on screen + scrollback).
+    ///
+    /// `lines` limits output to the last N lines of scrollback.
+    /// If None, captures the visible pane content.
+    pub fn capture_pane(&self, pane_id: &str, lines: Option<u32>) -> Result<String> {
+        let mut args = vec!["capture-pane", "-t", pane_id, "-p"];
+        let start_line;
+        if let Some(n) = lines {
+            start_line = format!("-{}", n);
+            args.extend(["-S", &start_line]);
+        }
+        let output = self.cmd().args(&args).output()
+            .context("failed to run tmux capture-pane")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux capture-pane failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+
+    /// Send raw keys to a pane without pressing Enter.
+    ///
+    /// Unlike `send_keys()`, this sends keystrokes without appending Enter
+    /// and without `-l` (literal mode), so tmux key names like `C-c`, `Enter`,
+    /// `Escape` are interpreted.
+    pub fn send_keys_raw(&self, pane_id: &str, keys: &str) -> Result<()> {
+        let status = self
+            .cmd()
+            .args(["send-keys", "-t", pane_id, keys])
+            .status()
+            .context("failed to run tmux send-keys (raw)")?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys (raw) failed");
+        }
+        Ok(())
+    }
+
     /// Kill the tmux server (only useful for isolated test servers).
     pub fn kill_server(&self) -> Result<()> {
         self.cmd()
