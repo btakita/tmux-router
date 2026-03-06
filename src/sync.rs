@@ -2483,4 +2483,57 @@ mod tests {
         assert!(t.pane_alive(&pane_d), "D still alive (stashed or broken out)");
         assert!(!log2.has_errors(), "sync2 errors: {:?}", log2.entries());
     }
+
+    #[test]
+    fn test_reconcile_ghost_pane_with_numeric_session() {
+        // Bug reproduction: 3 panes in window but only 2 desired.
+        // Session name is numeric ("0"), which caused ensure_stash_window
+        // to fail with "index 0 in use" (tmux parsed "0" as window index).
+        // Ghost pane was left in the target window instead of being stashed.
+        let t = IsolatedTmux::new("sync-test-ghost-numeric");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+
+        // Create 2 more panes in the same window (simulating 3 panes)
+        let pane_b = t
+            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap();
+        let pane_ghost = t
+            .raw_cmd(&["split-window", "-t", &pane_b, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap();
+
+        let initial = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(initial.len(), 3, "setup: 3 panes in window");
+
+        // Desired layout: only A and B (ghost should be evicted)
+        let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
+
+        // Use session_name = Some("test") to trigger stash path
+        let log = reconcile(
+            &t, &target_window, &pane_columns, &desired,
+            Some("test"), None, &dummy_registry_path(),
+        ).unwrap();
+
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(
+            final_panes.len(), 2,
+            "ghost pane should be stashed, got: {:?}", final_panes
+        );
+        assert!(final_panes.contains(&pane_a), "A in target");
+        assert!(final_panes.contains(&pane_b), "B in target");
+        assert!(!final_panes.contains(&pane_ghost), "ghost should not be in target");
+        assert!(t.pane_alive(&pane_ghost), "ghost still alive (stashed)");
+
+        // Verify ghost went to stash window (not a new visible window)
+        let stash = t.find_stash_window("test");
+        assert!(stash.is_some(), "stash window should exist");
+        let stash_panes = t.list_window_panes(&stash.unwrap()).unwrap();
+        assert!(stash_panes.contains(&pane_ghost), "ghost should be in stash window");
+
+        assert!(!log.has_errors(), "no errors: {:?}", log.entries());
+    }
 }

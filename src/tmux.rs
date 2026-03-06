@@ -417,13 +417,17 @@ impl Tmux {
         if let Some(w) = self.find_stash_window(session_name) {
             return Ok(w);
         }
+        // Append ":" to force session-name interpretation.
+        // Without it, a numeric session name like "0" is parsed as a window index,
+        // causing "index 0 in use" errors.
+        let target = format!("{}:", session_name);
         // Create a new detached window named "stash"
         let output = self
             .cmd()
             .args([
                 "new-window",
                 "-t",
-                session_name,
+                &target,
                 "-n",
                 "stash",
                 "-d",
