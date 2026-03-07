@@ -4,11 +4,85 @@
 //! hardcoding any particular registry location.
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 use crate::tmux::Tmux;
+
+// ---------------------------------------------------------------------------
+// Advisory file lock (flock on Unix, LockFileEx on Windows via fs2)
+// ---------------------------------------------------------------------------
+
+/// RAII guard for exclusive advisory lock on the registry file.
+///
+/// Acquire via `RegistryLock::acquire(registry_path)`. The lock file is
+/// `<registry_path>.lock` (sibling file). The lock is released when the
+/// guard is dropped.
+pub struct RegistryLock {
+    _file: File,
+    _path: PathBuf,
+}
+
+impl RegistryLock {
+    /// Acquire an exclusive advisory lock. Blocks until the lock is available.
+    pub fn acquire(registry_path: &Path) -> Result<Self> {
+        let lock_path = registry_path.with_extension("json.lock");
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
+        file.lock_exclusive()
+            .with_context(|| format!("failed to acquire lock on {}", lock_path.display()))?;
+        Ok(Self {
+            _file: file,
+            _path: lock_path,
+        })
+    }
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        // fs2 releases the lock when the file is closed (on drop),
+        // but explicit unlock is cleaner.
+        let _ = self._file.unlock();
+    }
+}
+
+/// Execute a read-modify-write operation on the registry under an exclusive lock.
+///
+/// The closure receives a mutable reference to the loaded registry. After the
+/// closure returns, the registry is saved back to disk. The lock is held for
+/// the entire duration, eliminating TOCTOU races.
+pub fn with_registry<F>(path: &Path, f: F) -> Result<()>
+where
+    F: FnOnce(&mut Registry) -> Result<()>,
+{
+    let _lock = RegistryLock::acquire(path)?;
+    let mut registry = load_registry(path)?;
+    f(&mut registry)?;
+    save_registry(path, &registry)?;
+    Ok(())
+}
+
+/// Like `with_registry`, but returns a value from the closure.
+pub fn with_registry_val<F, T>(path: &Path, f: F) -> Result<T>
+where
+    F: FnOnce(&mut Registry) -> Result<T>,
+{
+    let _lock = RegistryLock::acquire(path)?;
+    let mut registry = load_registry(path)?;
+    let val = f(&mut registry)?;
+    save_registry(path, &registry)?;
+    Ok(val)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryEntry {
@@ -57,7 +131,10 @@ pub fn lookup(registry_path: &Path, key: &str) -> Result<Option<String>> {
 
 /// Update the window field for all entries whose pane matches the given pane_id.
 /// Called after break_pane or join_pane moves a pane to a different window.
+///
+/// Acquires an exclusive advisory lock for the duration of the read-modify-write.
 pub fn update_window_for_entry(registry_path: &Path, pane_id: &str, new_window: &str) -> Result<()> {
+    let _lock = RegistryLock::acquire(registry_path)?;
     let mut registry = load_registry(registry_path)?;
     let mut changed = false;
     for entry in registry.values_mut() {
@@ -87,8 +164,11 @@ pub fn prune_dead(registry: &Registry, tmux: &Tmux) -> Registry {
 /// 2. Deduplicates entries pointing to the same pane (keeps most recent by `started` timestamp).
 /// 3. Saves if anything changed.
 ///
+/// Acquires an exclusive advisory lock for the duration of the read-modify-write.
+///
 /// Returns the number of entries removed.
 pub fn prune(registry_path: &Path, tmux: &Tmux) -> Result<usize> {
+    let _lock = RegistryLock::acquire(registry_path)?;
     let mut registry = load_registry(registry_path)?;
     let before = registry.len();
 

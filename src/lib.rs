@@ -5,5 +5,5 @@ pub mod registry;
 pub mod sync;
 
 pub use tmux::{Tmux, IsolatedTmux};
-pub use registry::{RegistryEntry, Registry, prune};
+pub use registry::{RegistryEntry, Registry, RegistryLock, prune, with_registry, with_registry_val};
 pub use sync::{FileResolution, SyncResult, sync};
