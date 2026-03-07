@@ -6,11 +6,17 @@
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use crate::tmux::Tmux;
+
+// Thread-local flag to detect nested lock acquisition (flock is not reentrant).
+thread_local! {
+    static REGISTRY_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+}
 
 // ---------------------------------------------------------------------------
 // Advisory file lock (flock on Unix, LockFileEx on Windows via fs2)
@@ -21,6 +27,7 @@ use crate::tmux::Tmux;
 /// Acquire via `RegistryLock::acquire(registry_path)`. The lock file is
 /// `<registry_path>.lock` (sibling file). The lock is released when the
 /// guard is dropped.
+#[derive(Debug)]
 pub struct RegistryLock {
     _file: File,
     _path: PathBuf,
@@ -28,7 +35,17 @@ pub struct RegistryLock {
 
 impl RegistryLock {
     /// Acquire an exclusive advisory lock. Blocks until the lock is available.
+    ///
+    /// If the current thread already holds a `RegistryLock`, returns `None`
+    /// with a warning instead of deadlocking (flock is not reentrant on Linux).
+    /// Use `acquire_or_skip()` when the caller can tolerate a no-op.
     pub fn acquire(registry_path: &Path) -> Result<Self> {
+        if REGISTRY_LOCK_HELD.get() {
+            anyhow::bail!(
+                "RegistryLock already held on this thread — would deadlock on {}",
+                registry_path.display()
+            );
+        }
         let lock_path = registry_path.with_extension("json.lock");
         if let Some(parent) = lock_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -41,10 +58,25 @@ impl RegistryLock {
             .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
         file.lock_exclusive()
             .with_context(|| format!("failed to acquire lock on {}", lock_path.display()))?;
+        REGISTRY_LOCK_HELD.set(true);
         Ok(Self {
             _file: file,
             _path: lock_path,
         })
+    }
+
+    /// Try to acquire the lock; if the current thread already holds it, return
+    /// `Ok(None)` with a warning instead of deadlocking. Callers should treat
+    /// `None` as "skip the locked operation."
+    pub fn acquire_or_skip(registry_path: &Path) -> Result<Option<Self>> {
+        if REGISTRY_LOCK_HELD.get() {
+            eprintln!(
+                "[registry] warning: RegistryLock already held on this thread, skipping nested lock for {}",
+                registry_path.display()
+            );
+            return Ok(None);
+        }
+        Ok(Some(Self::acquire(registry_path)?))
     }
 }
 
@@ -53,6 +85,7 @@ impl Drop for RegistryLock {
         // fs2 releases the lock when the file is closed (on drop),
         // but explicit unlock is cleaner.
         let _ = self._file.unlock();
+        REGISTRY_LOCK_HELD.set(false);
     }
 }
 
@@ -168,7 +201,10 @@ pub fn prune_dead(registry: &Registry, tmux: &Tmux) -> Registry {
 ///
 /// Returns the number of entries removed.
 pub fn prune(registry_path: &Path, tmux: &Tmux) -> Result<usize> {
-    let _lock = RegistryLock::acquire(registry_path)?;
+    let Some(_lock) = RegistryLock::acquire_or_skip(registry_path)? else {
+        eprintln!("[registry] prune skipped — lock already held on this thread");
+        return Ok(0);
+    };
     let mut registry = load_registry(registry_path)?;
     let before = registry.len();
 
@@ -203,4 +239,154 @@ pub fn prune(registry_path: &Path, tmux: &Tmux) -> Result<usize> {
         save_registry(registry_path, &registry)?;
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use tempfile::TempDir;
+
+    fn setup() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().unwrap();
+        let reg_path = dir.path().join("registry.json");
+        (dir, reg_path)
+    }
+
+    #[test]
+    fn acquire_lock_succeeds() {
+        let (_dir, reg_path) = setup();
+        let lock = RegistryLock::acquire(&reg_path);
+        assert!(lock.is_ok());
+    }
+
+    #[test]
+    fn lock_released_on_drop() {
+        let (_dir, reg_path) = setup();
+        {
+            let _lock = RegistryLock::acquire(&reg_path).unwrap();
+        }
+        // After drop, a second acquire should succeed
+        let lock2 = RegistryLock::acquire(&reg_path);
+        assert!(lock2.is_ok());
+    }
+
+    #[test]
+    fn nested_acquire_returns_error() {
+        let (_dir, reg_path) = setup();
+        let _lock = RegistryLock::acquire(&reg_path).unwrap();
+        let result = RegistryLock::acquire(&reg_path);
+        let err = result.err().expect("should fail on nested acquire");
+        assert!(
+            err.to_string().contains("already held"),
+            "error should mention 'already held', got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn acquire_or_skip_returns_none_on_reentrant() {
+        let (_dir, reg_path) = setup();
+        let _lock = RegistryLock::acquire(&reg_path).unwrap();
+        let result = RegistryLock::acquire_or_skip(&reg_path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn acquire_or_skip_returns_some_when_free() {
+        let (_dir, reg_path) = setup();
+        let result = RegistryLock::acquire_or_skip(&reg_path).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn with_registry_read_modify_write() {
+        let (_dir, reg_path) = setup();
+        save_registry(&reg_path, &Registry::new()).unwrap();
+
+        with_registry(&reg_path, |reg| {
+            reg.insert(
+                "test-key".to_string(),
+                RegistryEntry {
+                    pane: "%1".to_string(),
+                    pid: 1234,
+                    cwd: "/tmp".to_string(),
+                    started: "2026-01-01T00:00:00Z".to_string(),
+                    file: "test.md".to_string(),
+                    window: "@1".to_string(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = load_registry(&reg_path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["test-key"].pane, "%1");
+    }
+
+    #[test]
+    fn with_registry_val_returns_value() {
+        let (_dir, reg_path) = setup();
+        save_registry(&reg_path, &Registry::new()).unwrap();
+
+        let count = with_registry_val(&reg_path, |reg| {
+            reg.insert(
+                "a".to_string(),
+                RegistryEntry {
+                    pane: "%1".to_string(),
+                    pid: 1,
+                    cwd: "/".to_string(),
+                    started: "".to_string(),
+                    file: "".to_string(),
+                    window: "".to_string(),
+                },
+            );
+            Ok(reg.len())
+        })
+        .unwrap();
+
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn concurrent_with_registry_serializes_writes() {
+        let dir = TempDir::new().unwrap();
+        let reg_path = dir.path().join("registry.json");
+        save_registry(&reg_path, &Registry::new()).unwrap();
+
+        let n = 10;
+        let barrier = Arc::new(Barrier::new(n));
+        let mut handles = Vec::new();
+
+        for i in 0..n {
+            let path = reg_path.clone();
+            let bar = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                bar.wait();
+                with_registry(&path, |reg| {
+                    reg.insert(
+                        format!("key-{}", i),
+                        RegistryEntry {
+                            pane: format!("%{}", i),
+                            pid: i as u32,
+                            cwd: "/".to_string(),
+                            started: "".to_string(),
+                            file: "".to_string(),
+                            window: "".to_string(),
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_reg = load_registry(&reg_path).unwrap();
+        assert_eq!(final_reg.len(), n);
+    }
 }
