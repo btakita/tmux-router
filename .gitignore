@@ -1,3 +1,4 @@
 /target
 /book
 *.iml
+.agent-doc/
