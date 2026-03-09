@@ -251,6 +251,8 @@ pub struct SyncResult {
     pub target_session: Option<String>,
     /// The tmux window ID where panes were arranged.
     pub target_window: String,
+    /// File-to-pane assignments resolved during sync (path, pane_id).
+    pub file_panes: Vec<(PathBuf, String)>,
 }
 
 /// Sync editor layout to tmux panes.
@@ -371,13 +373,14 @@ pub fn sync(
     }
 
     // Helper: build an early SyncResult from the first resolved pane.
-    let early_result = |tmux: &Tmux| -> SyncResult {
+    let early_result = |tmux: &Tmux, file_to_pane: &std::collections::HashMap<PathBuf, String>| -> SyncResult {
         let win = resolved.first()
             .and_then(|r| tmux.pane_window(&r.pane_id).ok())
             .unwrap_or_default();
         SyncResult {
             target_session: doc_tmux_session.clone(),
             target_window: win,
+            file_panes: file_to_pane.iter().map(|(p, id)| (p.clone(), id.clone())).collect(),
         }
     };
 
@@ -386,7 +389,7 @@ pub fn sync(
         if let Some(r) = resolved.first() {
             tmux.select_pane(&r.pane_id)?;
         }
-        return Ok(early_result(tmux));
+        return Ok(early_result(tmux, &file_to_pane));
     }
 
     if resolved.len() < 2 {
@@ -403,7 +406,7 @@ pub fn sync(
         } else if let Some(r) = resolved.first() {
             tmux.select_pane(&r.pane_id)?;
         }
-        return Ok(early_result(tmux));
+        return Ok(early_result(tmux, &file_to_pane));
     }
 
     // --- Phase 3: Build the 2D column structure with resolved panes ---
@@ -432,7 +435,7 @@ pub fn sync(
     }
     if pane_columns.len() == 1 && pane_columns[0].len() == 1 {
         tmux.select_pane(&pane_columns[0][0])?;
-        return Ok(early_result(tmux));
+        return Ok(early_result(tmux, &file_to_pane));
     }
 
     // Collect the full set of wanted pane IDs
@@ -539,6 +542,7 @@ pub fn sync(
     Ok(SyncResult {
         target_session,
         target_window,
+        file_panes: file_to_pane.into_iter().collect(),
     })
 }
 
