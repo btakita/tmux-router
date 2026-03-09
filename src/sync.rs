@@ -372,6 +372,51 @@ pub fn sync(
         }
     }
 
+    // --- Phase 1.75: Assign spare window panes to still-unresolved files ---
+    // When find_column_pane fails (file is the sole occupant of its column),
+    // look for spare panes in the target window that aren't already assigned.
+    {
+        // Determine target window: --window arg, or window of first resolved pane
+        let target_win = window.map(|w| w.to_string()).or_else(|| {
+            resolved.first().and_then(|r| tmux.pane_window(&r.pane_id).ok())
+        });
+
+        if let Some(ref win_id) = target_win {
+            // Collect files still unresolved after Phase 1.5
+            let still_unresolved: Vec<PathBuf> = unresolved_files
+                .iter()
+                .filter(|f| !file_to_pane.contains_key(*f))
+                .cloned()
+                .collect();
+
+            if !still_unresolved.is_empty() {
+                let window_panes = tmux.list_window_panes(win_id).unwrap_or_default();
+                let assigned_panes: HashSet<&str> =
+                    file_to_pane.values().map(|s| s.as_str()).collect();
+                let mut spare_panes: Vec<String> = window_panes
+                    .into_iter()
+                    .filter(|p| !assigned_panes.contains(p.as_str()))
+                    .collect();
+
+                for file in &still_unresolved {
+                    if let Some(pane_id) = spare_panes.pop() {
+                        eprintln!(
+                            "auto-assign {} → {} (spare pane in window {})",
+                            file.display(),
+                            pane_id,
+                            win_id
+                        );
+                        file_to_pane.insert(file.clone(), pane_id.clone());
+                        resolved.push(ResolvedFile {
+                            path: file.clone(),
+                            pane_id,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     // Helper: build an early SyncResult from the first resolved pane.
     let early_result = |tmux: &Tmux, file_to_pane: &std::collections::HashMap<PathBuf, String>| -> SyncResult {
         let win = resolved.first()
@@ -2539,5 +2584,209 @@ mod tests {
         assert!(stash_panes.contains(&pane_ghost), "ghost should be in stash window");
 
         assert!(!log.has_errors(), "no errors: {:?}", log.entries());
+    }
+
+    #[test]
+    fn test_sync_spare_pane_for_unregistered_file() {
+        // Phase 1.75: When a file has a session key but no registry entry,
+        // and it's the sole file in its column (no column donor),
+        // sync should assign a spare pane from the target window.
+        let t = IsolatedTmux::new("sync-test-spare-pane");
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create two panes
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "50"]);
+        // Split to create second pane in same window
+        let pane_b = t
+            .raw_cmd(&[
+                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+            ])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Create test files
+        let file_a = tmp.path().join("registered.md");
+        let file_b = tmp.path().join("unregistered.md");
+        std::fs::write(&file_a, "# Registered").unwrap();
+        std::fs::write(&file_b, "# Unregistered").unwrap();
+
+        // Register only file_a in the registry
+        let registry_path = tmp.path().join("registry.json");
+        let mut registry = crate::registry::Registry::new();
+        registry.insert(
+            "session-aaa".to_string(),
+            crate::registry::RegistryEntry {
+                pane: pane_a.clone(),
+                pid: std::process::id(),
+                cwd: tmp.path().to_string_lossy().to_string(),
+                started: String::new(),
+                file: file_a.to_string_lossy().to_string(),
+                window: target_window.clone(),
+            },
+        );
+        crate::registry::save_registry(&registry_path, &registry).unwrap();
+
+        // file_b has a session key but no registry entry
+        let col_args = vec![
+            file_a.to_string_lossy().to_string(),
+            file_b.to_string_lossy().to_string(),
+        ];
+
+        let resolve_file = |path: &Path| -> Option<FileResolution> {
+            if path == file_a {
+                Some(FileResolution::Registered {
+                    key: "session-aaa".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else if path == file_b {
+                Some(FileResolution::Registered {
+                    key: "session-bbb".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else {
+                None
+            }
+        };
+
+        let result = sync(
+            &col_args,
+            Some(&target_window),
+            None,
+            &t,
+            &registry_path,
+            &resolve_file,
+        )
+        .unwrap();
+
+        // Verify: both files should have pane assignments in the result
+        assert_eq!(
+            result.file_panes.len(),
+            2,
+            "both files should have pane assignments, got: {:?}",
+            result.file_panes
+        );
+
+        let pane_for_a = result
+            .file_panes
+            .iter()
+            .find(|(p, _)| p == &file_a)
+            .map(|(_, id)| id.as_str());
+        let pane_for_b = result
+            .file_panes
+            .iter()
+            .find(|(p, _)| p == &file_b)
+            .map(|(_, id)| id.as_str());
+
+        assert_eq!(pane_for_a, Some(pane_a.as_str()), "registered file gets its pane");
+        assert!(pane_for_b.is_some(), "unregistered file gets a spare pane");
+        assert_eq!(pane_for_b, Some(pane_b.as_str()), "unregistered file gets the spare pane");
+    }
+
+    #[test]
+    fn test_sync_file_panes_includes_all_resolved() {
+        // Verify that SyncResult::file_panes contains entries for all
+        // resolved files, including those assigned via Phase 1.5 (column donor).
+        let t = IsolatedTmux::new("sync-test-file-panes");
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "50"]);
+        let pane_b = t
+            .raw_cmd(&[
+                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+            ])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let file_a = tmp.path().join("a.md");
+        let file_b = tmp.path().join("b.md");
+        let file_c = tmp.path().join("c.md"); // same column as a, unregistered
+        std::fs::write(&file_a, "# A").unwrap();
+        std::fs::write(&file_b, "# B").unwrap();
+        std::fs::write(&file_c, "# C").unwrap();
+
+        let registry_path = tmp.path().join("registry.json");
+        let mut registry = crate::registry::Registry::new();
+        registry.insert(
+            "session-aaa".to_string(),
+            crate::registry::RegistryEntry {
+                pane: pane_a.clone(),
+                pid: std::process::id(),
+                cwd: tmp.path().to_string_lossy().to_string(),
+                started: String::new(),
+                file: file_a.to_string_lossy().to_string(),
+                window: target_window.clone(),
+            },
+        );
+        registry.insert(
+            "session-bbb".to_string(),
+            crate::registry::RegistryEntry {
+                pane: pane_b.clone(),
+                pid: std::process::id(),
+                cwd: tmp.path().to_string_lossy().to_string(),
+                started: String::new(),
+                file: file_b.to_string_lossy().to_string(),
+                window: target_window.clone(),
+            },
+        );
+        crate::registry::save_registry(&registry_path, &registry).unwrap();
+
+        // Layout: col0=[a.md, c.md], col1=[b.md]
+        // c.md is unregistered but in same column as a.md → Phase 1.5 column donor
+        let col_args = vec![
+            format!("{},{}", file_a.to_string_lossy(), file_c.to_string_lossy()),
+            file_b.to_string_lossy().to_string(),
+        ];
+
+        let resolve_file = |path: &Path| -> Option<FileResolution> {
+            if path == file_a {
+                Some(FileResolution::Registered {
+                    key: "session-aaa".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else if path == file_b {
+                Some(FileResolution::Registered {
+                    key: "session-bbb".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else if path == file_c {
+                Some(FileResolution::Registered {
+                    key: "session-ccc".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else {
+                None
+            }
+        };
+
+        let result = sync(
+            &col_args,
+            Some(&target_window),
+            None,
+            &t,
+            &registry_path,
+            &resolve_file,
+        )
+        .unwrap();
+
+        // All three files should be in file_panes
+        assert!(
+            result.file_panes.len() >= 2,
+            "at least 2 file_panes expected, got: {:?}",
+            result.file_panes
+        );
+
+        let has_a = result.file_panes.iter().any(|(p, _)| p == &file_a);
+        let has_b = result.file_panes.iter().any(|(p, _)| p == &file_b);
+        let has_c = result.file_panes.iter().any(|(p, _)| p == &file_c);
+
+        assert!(has_a, "file_a should be in file_panes");
+        assert!(has_b, "file_b should be in file_panes");
+        assert!(has_c, "file_c (column donor) should be in file_panes");
     }
 }
