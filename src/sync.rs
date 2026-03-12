@@ -652,9 +652,10 @@ pub fn reconcile(
     if !current_set.contains(first_pane) {
         let existing = tmux.list_window_panes(target_window).unwrap_or_default();
         if let Some(target) = existing.first() {
-            match tmux.join_pane(first_pane, target, "-dbh") {
+            let flag = first_pane_join_flag(pane_columns, target);
+            match tmux.join_pane(first_pane, target, flag) {
                 Ok(()) => {
-                    log.log("ATTACH", format!("joined first {} into {}", first_pane, target_window));
+                    log.log("ATTACH", format!("joined first {} into {} ({})", first_pane, target_window, flag));
                     update_registry(tmux, first_pane, registry_path, &mut log);
                 }
                 Err(e) => {
@@ -787,6 +788,36 @@ pub fn reconcile(
     }
 
     Ok(log)
+}
+
+/// Determine the join flag when the first desired pane (anchor) needs to join
+/// the target window alongside an existing pane.
+///
+/// If the existing pane is a desired pane, compute the correct relative direction
+/// so the anchor lands in the right position without needing REORDER to fix it.
+/// If the existing pane is unwanted (will be detached), use `-dh` as a neutral default.
+fn first_pane_join_flag(pane_columns: &[Vec<String>], existing_pane: &str) -> &'static str {
+    // Find existing pane's position in the desired column structure
+    for (col_idx, column) in pane_columns.iter().enumerate() {
+        for (row_idx, pane) in column.iter().enumerate() {
+            if pane == existing_pane {
+                // Existing pane is desired. First pane (0,0) should be:
+                // - left of existing if existing is in a later column
+                // - above existing if existing is in same column but later row
+                if col_idx > 0 {
+                    return "-dbh"; // before (left), horizontal
+                } else if row_idx > 0 {
+                    return "-dbv"; // before (above), vertical
+                }
+                // Existing is at (0,0) — same as first pane, shouldn't happen
+                return "-dh";
+            }
+        }
+    }
+    // Existing pane is not desired (will be detached). Direction doesn't matter
+    // much since REORDER handles final positioning, but -dh (right) avoids the
+    // visual flicker of -dbh placing the anchor left of an unwanted pane.
+    "-dh"
 }
 
 /// Determine join target and split direction for a pane at (col_idx, row_idx).
@@ -1324,6 +1355,226 @@ mod tests {
             log.entries().iter().any(|e| e.phase == "ATTACH" && e.ok),
             "should have anchor move entry"
         );
+    }
+
+    /// Verify that when the anchor pane joins a window containing a desired pane
+    /// from a later column, the final ordered layout is column-major (no REORDER needed).
+    #[test]
+    fn test_sync_anchor_joins_left_of_desired_pane() {
+        let t = IsolatedTmux::new("sync-anchor-col-major");
+        let tmp = TempDir::new().unwrap();
+
+        // A (anchor) and B — each in separate windows. B's window is the target.
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_b).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+
+        // Desired: [[A], [B]] — two columns, A left, B right
+        let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
+
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+
+        // Final layout should be column-major: A (left), B (right)
+        let final_ordered = t.list_panes_ordered(&target_window).unwrap();
+        let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
+        assert_eq!(final_refs, desired, "layout should be column-major without REORDER");
+
+        // Should NOT have REORDER entries — the join flag should place A correctly
+        let has_reorder = log.entries().iter().any(|e| e.phase == "REORDER");
+        assert!(!has_reorder, "anchor join should use correct flag, avoiding REORDER: {:?}", log.entries());
+    }
+
+    /// Verify anchor joins above a desired pane in the same column (single-column layout).
+    #[test]
+    fn test_sync_anchor_joins_above_in_same_column() {
+        let t = IsolatedTmux::new("sync-anchor-same-col");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_b).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+
+        // Desired: [[A, B]] — single column, A above, B below
+        let pane_columns = vec![vec![pane_a.clone(), pane_b.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
+
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+
+        let final_ordered = t.list_panes_ordered(&target_window).unwrap();
+        let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
+        assert_eq!(final_refs, desired, "layout should stack A above B without REORDER");
+
+        let has_reorder = log.entries().iter().any(|e| e.phase == "REORDER");
+        assert!(!has_reorder, "anchor join should use vertical flag, avoiding REORDER: {:?}", log.entries());
+    }
+
+    /// Verify first_pane_join_flag returns correct flags for various pane positions.
+    #[test]
+    fn test_first_pane_join_flag_logic() {
+        let cols = vec![
+            vec!["A".to_string(), "B".to_string()],
+            vec!["C".to_string()],
+        ];
+
+        // Target is in later column → anchor goes left (-dbh)
+        assert_eq!(first_pane_join_flag(&cols, "C"), "-dbh");
+
+        // Target is in same column, later row → anchor goes above (-dbv)
+        assert_eq!(first_pane_join_flag(&cols, "B"), "-dbv");
+
+        // Target is not in desired set → neutral default (-dh)
+        assert_eq!(first_pane_join_flag(&cols, "X"), "-dh");
+    }
+
+    /// Single pane layout — trivial case, no joins needed.
+    #[test]
+    fn test_sync_single_pane_layout() {
+        let t = IsolatedTmux::new("sync-single-pane");
+        let (target_window, panes, _tmp) = setup_panes(&t, 1);
+
+        let pane_columns = vec![vec![panes[0].clone()]];
+        let desired: Vec<&str> = vec![panes[0].as_str()];
+
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+
+        let final_ordered = t.list_panes_ordered(&target_window).unwrap();
+        assert_eq!(final_ordered.len(), 1);
+        assert_eq!(final_ordered[0], panes[0]);
+        // Should hit fast path — pane already in correct position
+        assert!(log.entries().iter().any(|e| e.phase == "FAST_PATH"));
+    }
+
+    /// 2x2 grid layout: [[A, B], [C, D]] — 2 columns, 2 rows each.
+    /// Verifies column-major order: A (top-left), B (bottom-left), C (top-right), D (bottom-right).
+    #[test]
+    fn test_sync_2x2_grid_layout() {
+        let t = IsolatedTmux::new("sync-2x2-grid");
+        let (target_window, panes, _tmp) = setup_panes(&t, 4);
+
+        // [[A, B], [C, D]] — column-major
+        let pane_columns = vec![
+            vec![panes[0].clone(), panes[1].clone()],
+            vec![panes[2].clone(), panes[3].clone()],
+        ];
+        let desired: Vec<&str> = vec![
+            panes[0].as_str(),
+            panes[1].as_str(),
+            panes[2].as_str(),
+            panes[3].as_str(),
+        ];
+
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+
+        let final_ordered = t.list_panes_ordered(&target_window).unwrap();
+        let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
+        assert_eq!(final_refs, desired, "2x2 grid should be column-major order");
+        assert!(!log.has_errors(), "2x2 grid should have no errors: {:?}", log.entries());
+    }
+
+    /// 2x2 grid with anchor not in target — anchor must join with correct flag.
+    #[test]
+    fn test_sync_2x2_grid_anchor_elsewhere() {
+        let t = IsolatedTmux::new("sync-2x2-anchor-elsewhere");
+        let tmp = TempDir::new().unwrap();
+
+        // Create 4 panes: A, B, C, D — each in separate windows
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+        let pane_c = t.new_window("test", tmp.path()).unwrap();
+        let pane_d = t.new_window("test", tmp.path()).unwrap();
+
+        // Use C's window as target — A is anchor but not in target
+        let target_window = t.pane_window(&pane_c).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+
+        let pane_columns = vec![
+            vec![pane_a.clone(), pane_b.clone()],
+            vec![pane_c.clone(), pane_d.clone()],
+        ];
+        let desired: Vec<&str> = vec![
+            pane_a.as_str(),
+            pane_b.as_str(),
+            pane_c.as_str(),
+            pane_d.as_str(),
+        ];
+
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+
+        let final_ordered = t.list_panes_ordered(&target_window).unwrap();
+        let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
+        assert_eq!(final_refs, desired, "2x2 grid with anchor elsewhere should produce correct column-major order");
+        assert!(!log.has_errors());
+    }
+
+    /// 3-column layout: [[A], [B], [C]] — horizontal only, no vertical stacking.
+    #[test]
+    fn test_sync_3col_horizontal_layout() {
+        let t = IsolatedTmux::new("sync-3col-horizontal");
+        let (target_window, panes, _tmp) = setup_panes(&t, 3);
+
+        let pane_columns = vec![
+            vec![panes[0].clone()],
+            vec![panes[1].clone()],
+            vec![panes[2].clone()],
+        ];
+        let desired: Vec<&str> = vec![panes[0].as_str(), panes[1].as_str(), panes[2].as_str()];
+
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+
+        let final_ordered = t.list_panes_ordered(&target_window).unwrap();
+        let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
+        assert_eq!(final_refs, desired, "3-column horizontal layout should be left-to-right");
+        assert!(!log.has_errors());
+    }
+
+    /// Asymmetric layout: [[A, B, C], [D]] — tall left column, short right column.
+    #[test]
+    fn test_sync_asymmetric_3_1_layout() {
+        let t = IsolatedTmux::new("sync-asymmetric-3-1");
+        let (target_window, panes, _tmp) = setup_panes(&t, 4);
+
+        let pane_columns = vec![
+            vec![panes[0].clone(), panes[1].clone(), panes[2].clone()],
+            vec![panes[3].clone()],
+        ];
+        let desired: Vec<&str> = vec![
+            panes[0].as_str(),
+            panes[1].as_str(),
+            panes[2].as_str(),
+            panes[3].as_str(),
+        ];
+
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+
+        let final_ordered = t.list_panes_ordered(&target_window).unwrap();
+        let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
+        assert_eq!(final_refs, desired, "asymmetric 3+1 layout should be column-major");
+        assert!(!log.has_errors());
+    }
+
+    /// Verify first_pane_join_flag handles larger grid: [[A,B,C], [D,E], [F]].
+    #[test]
+    fn test_first_pane_join_flag_3col_grid() {
+        let cols = vec![
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            vec!["D".to_string(), "E".to_string()],
+            vec!["F".to_string()],
+        ];
+
+        // Same column, different rows
+        assert_eq!(first_pane_join_flag(&cols, "B"), "-dbv");
+        assert_eq!(first_pane_join_flag(&cols, "C"), "-dbv");
+
+        // Later columns
+        assert_eq!(first_pane_join_flag(&cols, "D"), "-dbh");
+        assert_eq!(first_pane_join_flag(&cols, "E"), "-dbh");
+        assert_eq!(first_pane_join_flag(&cols, "F"), "-dbh");
+
+        // Unwanted
+        assert_eq!(first_pane_join_flag(&cols, "Z"), "-dh");
     }
 
     #[test]
