@@ -117,7 +117,9 @@ impl Tmux {
     /// Enter separately. A small delay between text and Enter ensures the TUI
     /// (e.g., Claude Code) processes the input before the submit.
     pub fn send_keys(&self, pane_id: &str, text: &str) -> Result<()> {
-        // Send text literally (no tmux key interpretation)
+        // Send text + Enter in a single tmux command to avoid timing issues.
+        // Using two separate args: first the literal text (-l), then Enter as
+        // a separate non-literal key. tmux processes them atomically in one call.
         let status = self
             .cmd()
             .args(["send-keys", "-t", pane_id, "-l", text])
@@ -127,8 +129,8 @@ impl Tmux {
             anyhow::bail!("tmux send-keys failed (text)");
         }
 
-        // Brief pause for TUI to process input
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Brief pause for TUI to process literal text before Enter.
+        std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Send Enter separately
         let status = self
@@ -161,6 +163,19 @@ impl Tmux {
             .context("failed to run tmux select-pane")?;
         if !status.success() {
             anyhow::bail!("tmux select-pane failed for {}", pane_id);
+        }
+
+        // Log the session for debugging. select-window + select-pane already
+        // switched the active pane within the session. We do NOT switch-client
+        // because that would force ALL terminal clients to jump sessions,
+        // disrupting the user's layout.
+        if let Ok(output) = self
+            .cmd()
+            .args(["display-message", "-t", pane_id, "-p", "#{session_name}:#{window_index}"])
+            .output()
+        {
+            let info = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            eprintln!("[tmux] select_pane {} → session:window {}", pane_id, info);
         }
         Ok(())
     }
