@@ -180,6 +180,37 @@ impl Tmux {
         Ok(())
     }
 
+    /// Split an existing pane, creating a new pane in the same window.
+    ///
+    /// Returns the pane ID of the newly created pane.
+    /// `target_pane` is the pane to split. `cwd` sets the working directory.
+    /// `flags` controls split direction: `-h` for horizontal (side-by-side),
+    /// `-v` for vertical (stacked). Can include `-d` (don't focus new pane).
+    pub fn split_window(&self, target_pane: &str, cwd: &Path, flags: &str) -> Result<String> {
+        let output = self
+            .cmd()
+            .args([
+                "split-window",
+                "-t",
+                target_pane,
+                flags,
+                "-c",
+                &cwd.to_string_lossy(),
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
+            .output()
+            .context("failed to run tmux split-window")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux split-window failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// Move a pane into another pane's window with the given split direction.
     ///
     /// `split_flag` is `-h` for horizontal (side-by-side) or `-v` for vertical (stacked).
