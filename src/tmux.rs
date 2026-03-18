@@ -145,30 +145,20 @@ impl Tmux {
     }
 
     /// Select (focus) a tmux pane.
+    ///
+    /// Uses TmuxBatch to combine select-window + select-pane in a single
+    /// tmux invocation, reducing flicker.
     pub fn select_pane(&self, pane_id: &str) -> Result<()> {
-        // Switch to the window containing the pane first (select-pane alone
-        // doesn't change the active window).
-        let status = self
-            .cmd()
-            .args(["select-window", "-t", pane_id])
-            .status()
-            .context("failed to run tmux select-window")?;
-        if !status.success() {
-            anyhow::bail!("tmux select-window failed for {}", pane_id);
-        }
-        let status = self
-            .cmd()
-            .args(["select-pane", "-t", pane_id])
-            .status()
-            .context("failed to run tmux select-pane")?;
-        if !status.success() {
-            anyhow::bail!("tmux select-pane failed for {}", pane_id);
-        }
+        // Batch select-window + select-pane into one invocation.
+        // select-pane alone doesn't change the active window.
+        let mut batch = TmuxBatch::new(self);
+        batch.add(&["select-window", "-t", pane_id]);
+        batch.add(&["select-pane", "-t", pane_id]);
+        batch.execute()
+            .with_context(|| format!("failed to select pane {}", pane_id))?;
 
-        // Log the session for debugging. select-window + select-pane already
-        // switched the active pane within the session. We do NOT switch-client
-        // because that would force ALL terminal clients to jump sessions,
-        // disrupting the user's layout.
+        // Log the session for debugging. We do NOT switch-client
+        // because that would force ALL terminal clients to jump sessions.
         if let Ok(output) = self
             .cmd()
             .args(["display-message", "-t", pane_id, "-p", "#{session_name}:#{window_index}"])
@@ -741,5 +731,134 @@ impl std::ops::Deref for IsolatedTmux {
     type Target = Tmux;
     fn deref(&self) -> &Tmux {
         &self.tmux
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TmuxBatch — fire-and-forget command batching via `\;` separator
+// ---------------------------------------------------------------------------
+
+/// Batch multiple tmux commands into a single invocation using `\;` separator.
+///
+/// This reduces visual flicker by executing all commands in a single tmux
+/// server tick instead of spawning separate processes for each operation.
+///
+/// # Usage
+///
+/// ```no_run
+/// # use tmux_router::tmux::{Tmux, TmuxBatch};
+/// let tmux = Tmux::default_server();
+/// let mut batch = TmuxBatch::new(&tmux);
+/// batch.add(&["select-window", "-t", "%5"]);
+/// batch.add(&["select-pane", "-t", "%5"]);
+/// batch.add(&["send-keys", "-t", "%5", "hello", "Enter"]);
+/// batch.execute().unwrap();
+/// ```
+pub struct TmuxBatch<'a> {
+    tmux: &'a Tmux,
+    commands: Vec<Vec<String>>,
+}
+
+impl<'a> TmuxBatch<'a> {
+    /// Create a new empty batch.
+    pub fn new(tmux: &'a Tmux) -> Self {
+        Self {
+            tmux,
+            commands: Vec::new(),
+        }
+    }
+
+    /// Add a tmux command (as argument slices) to the batch.
+    pub fn add(&mut self, args: &[&str]) -> &mut Self {
+        self.commands.push(args.iter().map(|s| s.to_string()).collect());
+        self
+    }
+
+    /// True if no commands have been added.
+    pub fn is_empty(&self) -> bool {
+        self.commands.is_empty()
+    }
+
+    /// Number of commands in the batch.
+    pub fn len(&self) -> usize {
+        self.commands.len()
+    }
+
+    /// Execute all batched commands in a single tmux invocation.
+    ///
+    /// Commands are joined with `\;` (tmux command separator).
+    /// Returns Ok(()) if the combined invocation succeeds.
+    /// This is fire-and-forget — individual command failures are not
+    /// distinguishable from the batch exit code.
+    pub fn execute(&self) -> Result<()> {
+        if self.commands.is_empty() {
+            return Ok(());
+        }
+
+        let mut cmd = self.tmux.cmd();
+        for (i, args) in self.commands.iter().enumerate() {
+            if i > 0 {
+                cmd.arg(";");
+            }
+            cmd.args(args);
+        }
+
+        let status = cmd
+            .status()
+            .context("failed to execute tmux batch")?;
+
+        if !status.success() {
+            anyhow::bail!("tmux batch failed (exit code {:?})", status.code());
+        }
+        Ok(())
+    }
+
+    /// Execute and return stdout (useful for batches ending with a display-message).
+    pub fn execute_output(&self) -> Result<String> {
+        if self.commands.is_empty() {
+            return Ok(String::new());
+        }
+
+        let mut cmd = self.tmux.cmd();
+        for (i, args) in self.commands.iter().enumerate() {
+            if i > 0 {
+                cmd.arg(";");
+            }
+            cmd.args(args);
+        }
+
+        let output = cmd
+            .output()
+            .context("failed to execute tmux batch")?;
+
+        if !output.status.success() {
+            anyhow::bail!("tmux batch failed (exit code {:?})", output.status.code());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn empty_batch_is_noop() {
+        let tmux = Tmux::default_server();
+        let batch = TmuxBatch::new(&tmux);
+        assert!(batch.is_empty());
+        assert_eq!(batch.len(), 0);
+        // Execute should succeed without running anything
+        batch.execute().unwrap();
+    }
+
+    #[test]
+    fn batch_tracks_command_count() {
+        let tmux = Tmux::default_server();
+        let mut batch = TmuxBatch::new(&tmux);
+        batch.add(&["list-sessions"]);
+        batch.add(&["list-windows"]);
+        assert!(!batch.is_empty());
+        assert_eq!(batch.len(), 2);
     }
 }
