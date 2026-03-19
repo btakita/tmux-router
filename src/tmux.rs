@@ -87,13 +87,16 @@ impl Tmux {
 
     /// Create a new window in an existing tmux session and return the pane ID.
     pub fn new_window(&self, session: &str, cwd: &Path) -> Result<String> {
+        // Append ":" to force session-name interpretation.
+        // Without it, numeric names like "0" are parsed as window indices.
+        let target = format!("{}:", session);
         let output = self
             .cmd()
             .args([
                 "new-window",
                 "-a",
                 "-t",
-                session,
+                &target,
                 "-c",
                 &cwd.to_string_lossy(),
                 "-P",
@@ -407,7 +410,7 @@ impl Tmux {
             .args([
                 "display-message",
                 "-t",
-                session_name,
+                &format!("{}:", session_name),
                 "-p",
                 "#{pane_id}",
             ])
@@ -427,7 +430,7 @@ impl Tmux {
             .args([
                 "list-windows",
                 "-t",
-                session_name,
+                &format!("{}:", session_name),
                 "-F",
                 "#{window_id} #{window_name}",
             ])
