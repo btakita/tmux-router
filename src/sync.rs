@@ -705,6 +705,12 @@ pub fn reconcile(
 
     // --- DETACH unwanted panes ---
     let refreshed = tmux.list_window_panes(target_window).unwrap_or_default();
+    // Log active window before detach for focus-steal diagnosis
+    let active_before_detach = session_name
+        .and_then(|s| tmux.active_window(s))
+        .unwrap_or_default();
+    log.log("DETACH", format!("active_window_before={}", active_before_detach));
+
     for pane in &refreshed {
         if wanted.contains(pane.as_str()) {
             continue;
@@ -723,6 +729,16 @@ pub fn reconcile(
             Ok(()) => {
                 log.log("DETACH", format!("{} {} from {}", verb, pane, target_window));
                 update_registry(tmux, pane, registry_path, &mut log);
+                // Log active window after each stash to detect focus steal
+                let active_after = session_name
+                    .and_then(|s| tmux.active_window(s))
+                    .unwrap_or_default();
+                if active_after != active_before_detach {
+                    log.log_err("DETACH", format!(
+                        "FOCUS STEAL: active window changed {} → {} after stashing {}",
+                        active_before_detach, active_after, pane
+                    ));
+                }
             }
             Err(e) => {
                 log.log_err("DETACH", format!("failed to detach {}: {}", pane, e));
@@ -730,7 +746,16 @@ pub fn reconcile(
         }
     }
 
-    // Re-select target window after stash operations
+    // Re-select target window after stash operations (restore focus if stolen)
+    let active_after_detach = session_name
+        .and_then(|s| tmux.active_window(s))
+        .unwrap_or_default();
+    if active_after_detach != target_window {
+        log.log("DETACH", format!(
+            "restoring focus: {} → {} (was stolen during stash)",
+            active_after_detach, target_window
+        ));
+    }
     let _ = tmux.select_window(target_window);
     let sel = session_name.and_then(|s| tmux.active_pane(s)).unwrap_or_default();
     log.log("DETACH", format!("done — selected={}", sel));

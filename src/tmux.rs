@@ -423,6 +423,26 @@ impl Tmux {
         if pane.is_empty() { None } else { Some(pane) }
     }
 
+    /// Get the currently active window ID for a session.
+    pub fn active_window(&self, session_name: &str) -> Option<String> {
+        let output = self
+            .cmd()
+            .args([
+                "display-message",
+                "-t",
+                &format!("{}:", session_name),
+                "-p",
+                "#{window_id}",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let win = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if win.is_empty() { None } else { Some(win) }
+    }
+
     /// Find a window named "stash" in the given tmux session.
     pub fn find_stash_window(&self, session_name: &str) -> Option<String> {
         let output = self
@@ -496,24 +516,107 @@ impl Tmux {
             }
         };
         let stash_panes = self.list_window_panes(&stash_window).unwrap_or_default();
-        if let Some(target) = stash_panes.first() {
+        if !stash_panes.is_empty() {
             // Resize stash window tall enough to accept another pane.
             // tmux enforces a minimum per-pane height that varies by content,
             // so use a generous fixed size. The stash window is never displayed.
             let _ = self.raw_cmd(&[
                 "resize-window", "-t", &stash_window, "-y", "200",
             ]);
+            // Target the LARGEST pane in the stash to avoid "pane too small" errors.
+            // tmux join-pane splits the target pane — if it's only 1 row, the join fails.
+            let target = self.largest_pane_in_window(&stash_window)
+                .unwrap_or_else(|| stash_panes[0].clone());
             // Use -dv: -d prevents changing the active pane, -v stacks vertically.
             // Fall back to break_pane if join still fails.
-            match self.join_pane(pane_id, target, "-dv") {
+            match self.join_pane(pane_id, &target, "-dv") {
                 Ok(()) => Ok(()),
-                Err(_) => self.break_pane(pane_id),
+                Err(e) => {
+                    eprintln!("[stash] join-pane {} → {} failed ({}), creating overflow stash", pane_id, target, e);
+                    self.break_pane_to_stash(pane_id, session_name)
+                }
             }
         } else {
             // Empty stash window shouldn't happen (new-window creates a shell pane),
-            // but fall back to break_pane just in case.
-            self.break_pane(pane_id)
+            // but create a stash overflow window just in case.
+            self.break_pane_to_stash(pane_id, session_name)
         }
+    }
+
+    /// Find the largest pane (by height) in a window.
+    /// Returns the pane ID with the most rows, suitable as a join target.
+    pub fn largest_pane_in_window(&self, window_id: &str) -> Option<String> {
+        let output = self
+            .cmd()
+            .args([
+                "list-panes",
+                "-t",
+                window_id,
+                "-F",
+                "#{pane_id} #{pane_height}",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let id = parts.next()?.to_string();
+                let height: usize = parts.next()?.parse().ok()?;
+                Some((id, height))
+            })
+            .max_by_key(|(_, h)| *h)
+            .map(|(id, _)| id)
+    }
+
+    /// Break a pane out and name the new window "stash" so it's tracked
+    /// as part of the stash inventory. Used as fallback when join-pane
+    /// to the primary stash window fails (pane too small).
+    pub fn break_pane_to_stash(&self, pane_id: &str, session_name: &str) -> Result<()> {
+        // break-pane -d creates a new detached window
+        self.break_pane(pane_id)?;
+        // Find the window that now contains this pane and rename it to "stash"
+        if let Ok(window_id) = self.pane_window(pane_id) {
+            let _ = self.raw_cmd(&[
+                "rename-window", "-t", &window_id, "stash",
+            ]);
+            eprintln!("[stash] created overflow stash window {} for pane {}", window_id, pane_id);
+        }
+        Ok(())
+    }
+
+    /// Find ALL windows named "stash" in the session (primary + overflow).
+    pub fn find_all_stash_windows(&self, session_name: &str) -> Vec<String> {
+        let output = match self
+            .cmd()
+            .args([
+                "list-windows",
+                "-t",
+                &format!("{}:", session_name),
+                "-F",
+                "#{window_id} #{window_name}",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, ' ');
+                let window_id = parts.next()?;
+                let window_name = parts.next().unwrap_or("");
+                if window_name == "stash" {
+                    Some(window_id.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Run a raw tmux command and return stdout.
