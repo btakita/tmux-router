@@ -532,22 +532,24 @@ impl Tmux {
         let stash_panes = self.list_window_panes(&stash_window).unwrap_or_default();
         if !stash_panes.is_empty() {
             // Resize stash window tall enough to accept another pane.
-            // tmux enforces a minimum per-pane height that varies by content,
-            // so use a generous fixed size. The stash window is never displayed.
+            // Use a very large size to prevent "pane too small" errors.
+            // The stash window is never displayed, so size doesn't matter visually.
             let _ = self.raw_cmd(&[
-                "resize-window", "-t", &stash_window, "-y", "200",
+                "resize-window", "-t", &stash_window, "-y", "1000",
             ]);
             // Target the LARGEST pane in the stash to avoid "pane too small" errors.
             // tmux join-pane splits the target pane — if it's only 1 row, the join fails.
             let target = self.largest_pane_in_window(&stash_window)
                 .unwrap_or_else(|| stash_panes[0].clone());
             // Use -dv: -d prevents changing the active pane, -v stacks vertically.
-            // Fall back to break_pane if join still fails.
+            // On failure: kill the pane instead of creating an orphan stash window.
+            // Creating orphan windows (via break_pane) causes stash proliferation.
             match self.join_pane(pane_id, &target, "-dv") {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    eprintln!("[stash] join-pane {} → {} failed ({}), creating overflow stash", pane_id, target, e);
-                    self.break_pane_to_stash(pane_id, session_name)
+                    eprintln!("[stash] join-pane {} → {} failed ({}), killing pane to prevent orphan window", pane_id, target, e);
+                    let _ = self.kill_pane(pane_id);
+                    Ok(())
                 }
             }
         } else {
