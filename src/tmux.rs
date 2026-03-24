@@ -220,6 +220,20 @@ impl Tmux {
         Ok(())
     }
 
+    /// Atomically swap two panes (even across windows).
+    /// `-d` prevents focus change. The src pane moves to dst's position and vice versa.
+    pub fn swap_pane(&self, src: &str, dst: &str) -> Result<()> {
+        let status = self
+            .cmd()
+            .args(["swap-pane", "-s", src, "-t", dst, "-d"])
+            .status()
+            .context("failed to run tmux swap-pane")?;
+        if !status.success() {
+            anyhow::bail!("tmux swap-pane failed: {} ↔ {}", src, dst);
+        }
+        Ok(())
+    }
+
     /// Break a pane out of its window into a new window.
     pub fn break_pane(&self, pane_id: &str) -> Result<()> {
         let status = self

@@ -647,6 +647,45 @@ pub fn reconcile(
     let current_panes = tmux.list_window_panes(target_window).unwrap_or_default();
     let current_set: HashSet<String> = current_panes.iter().cloned().collect();
 
+    // --- SWAP fast path: 1:1 pane replacement ---
+    // When exactly one pane needs to come in and one needs to go out,
+    // use swap-pane for an atomic visual transition (no flicker).
+    let to_attach: Vec<&str> = desired_ordered.iter()
+        .copied()
+        .filter(|p| !current_set.contains(*p))
+        .collect();
+    let to_detach: Vec<&str> = current_panes.iter()
+        .map(|s| s.as_str())
+        .filter(|p| !wanted.contains(p))
+        .collect();
+
+    if to_attach.len() == 1 && to_detach.len() == 1 {
+        let incoming = to_attach[0];
+        let outgoing = to_detach[0];
+
+        // Only swap if the incoming pane is alive (exists somewhere)
+        if tmux.pane_window(incoming).is_ok() {
+            match tmux.swap_pane(incoming, outgoing) {
+                Ok(()) => {
+                    log.log("SWAP", format!("{} ↔ {} (atomic)", incoming, outgoing));
+                    update_registry(tmux, incoming, registry_path, &mut log);
+                    update_registry(tmux, outgoing, registry_path, &mut log);
+
+                    // Select focus pane
+                    let select_target = focus_pane.unwrap_or(first_pane);
+                    let _ = tmux.select_pane(select_target);
+                    log.log("SELECT", format!("focused {}", select_target));
+
+                    return Ok(log);
+                }
+                Err(e) => {
+                    log.log_err("SWAP", format!("swap-pane failed ({} ↔ {}): {}, falling back to join+stash", incoming, outgoing, e));
+                    // Fall through to normal ATTACH/DETACH
+                }
+            }
+        }
+    }
+
     // --- ATTACH missing desired panes ---
     // First, ensure the first desired pane is in the target window.
     if !current_set.contains(first_pane) {
