@@ -1674,13 +1674,13 @@ mod tests {
         assert!(!final_panes.contains(&pane_x));
         assert!(t.pane_alive(&pane_x), "X should still be alive");
 
+        // With swap-pane fast path, a 1:1 replacement uses SWAP instead of DETACH+ATTACH
+        let has_swap = log.entries().iter().any(|e| e.phase == "SWAP" && e.ok);
+        let has_detach_attach = log.entries().iter().any(|e| e.phase == "DETACH" && e.ok)
+            && log.entries().iter().any(|e| e.phase == "ATTACH" && e.ok);
         assert!(
-            log.entries().iter().any(|e| e.phase == "DETACH" && e.ok),
-            "should have evict"
-        );
-        assert!(
-            log.entries().iter().any(|e| e.phase == "ATTACH" && e.ok),
-            "should have join"
+            has_swap || has_detach_attach,
+            "should have swap or detach+attach"
         );
 
         // Snapshot-based state assertions
