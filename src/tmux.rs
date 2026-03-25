@@ -1,4 +1,103 @@
-//! Tmux server handle — supports isolated `-L` servers for testing.
+//! # Module: tmux
+//!
+//! Tmux server handle and command abstraction. Supports isolated `-L` socket
+//! servers for hermetic testing alongside the default user tmux server.
+//!
+//! ## Spec
+//!
+//! - `Tmux` wraps all tmux CLI interactions; constructed with either the
+//!   default server (`Tmux::default_server()`) or a named socket for isolation.
+//! - `Tmux::cmd()` emits a `Command` pre-configured with `-L <socket> -f /dev/null`
+//!   when `server_socket` is set, or bare `tmux` for the default server.
+//! - `pane_alive(pane_id)` — returns true iff `pane_id` appears in `list-panes -a`.
+//! - `running()` — returns true iff the server has at least one session.
+//! - `session_exists(name)` / `session_alive(name)` — check session presence by name.
+//! - `new_session(name, cwd)` — creates a detached session and returns its first pane ID.
+//! - `new_window(session, cwd)` — creates a new window in an existing session and
+//!   returns the pane ID; uses `session:` target syntax to avoid numeric-name ambiguity.
+//! - `send_keys(pane_id, text)` — sends text literally (`-l`) then `Enter` as a
+//!   separate call with a 100 ms delay between them for TUI compatibility.
+//! - `send_keys_raw(pane_id, keys)` — sends keystrokes without literal mode or Enter,
+//!   allowing tmux key names (`C-c`, `Escape`, etc.) to be interpreted.
+//! - `select_pane(pane_id)` — focuses a pane by batching `select-window` +
+//!   `select-pane`; never calls `switch-client` to avoid disrupting other clients.
+//! - `split_window(target, cwd, flags)` — splits a pane with caller-specified flags
+//!   (`-h`/`-v`, `-d`) and returns the new pane ID.
+//! - `join_pane(src, dst, split_flag)` — moves `src` into `dst`'s window.
+//! - `swap_pane(src, dst)` — atomically swaps two panes without focus change (`-d`).
+//! - `break_pane(pane_id)` — breaks a pane into a new detached window.
+//! - `kill_pane(pane_id)` — kills a pane; refuses (returns `Err`) if it is the sole
+//!   pane in the sole window of its session to prevent accidental session destruction.
+//! - `session_window_count(session)` — counts windows in a session.
+//! - `pane_window(pane_id)` / `pane_session(target)` — resolve containment hierarchy.
+//! - `list_window_panes(window_id)` — lists all pane IDs in a window.
+//! - `list_panes_ordered(window_id)` — same but sorted by left/top screen position.
+//! - `largest_pane_in_window(window_id)` — returns the pane ID with the most rows.
+//! - `resize_pane(pane_id, flag, size)` — resizes a pane to a percentage.
+//! - `window_height(window_id)` / `pane_height(pane_id)` — query row counts.
+//! - `select_layout(window_id, layout)` / `select_window(window_id)` — layout control.
+//! - `active_pane(session)` / `active_window(session)` — query current focus.
+//! - `find_stash_window(session)` — finds the first window named "stash" in a session.
+//! - `find_all_stash_windows(session)` — finds ALL windows named "stash" (primary + overflow).
+//! - `ensure_stash_window(session)` — idempotently creates the stash window if absent.
+//! - `stash_pane(pane_id, session)` — moves a pane into the stash window; falls back
+//!   to `break_pane_to_stash` on join failure; never creates orphan windows silently.
+//! - `break_pane_to_stash(pane_id, session)` — breaks pane and renames new window "stash".
+//! - `auto_start(session, cwd)` — creates a session if the server or session is absent,
+//!   otherwise creates a new window; returns the new pane ID.
+//! - `capture_pane(pane_id, lines)` — captures visible content or N scrollback lines.
+//! - `raw_cmd(args)` — escape hatch for arbitrary tmux commands; returns trimmed stdout.
+//! - `list_all_windows()` / `list_all_panes()` — global state summaries for logging.
+//! - `dump_tmux_tree()` — formats a full session→window→pane tree as a string.
+//! - `kill_server()` — kills the tmux server (intended for isolated test teardown).
+//! - `IsolatedTmux` — RAII wrapper that kills its `-L` server on drop; dereferences
+//!   to `Tmux` for all method access.
+//! - `TmuxBatch` — accumulates tmux commands and fires them in a single invocation
+//!   joined by `;`; supports `execute()` (status only) and `execute_output()` (stdout).
+//!
+//! ## Agentic Contracts
+//!
+//! - All methods that mutate tmux state return `Result<_>` and propagate errors;
+//!   callers must handle failures explicitly — no silent swallows except in boolean
+//!   probe methods (`pane_alive`, `running`, `session_exists`, `session_alive`).
+//! - `kill_pane` never destroys an entire session silently; it returns `Err` when
+//!   the kill would be session-destructive.
+//! - `stash_pane` never silently drops a pane; on all failure paths it either joins,
+//!   breaks-to-stash, or returns an error.
+//! - `select_pane` never disrupts other connected terminal clients (`switch-client`
+//!   is intentionally omitted).
+//! - `send_keys` always interprets its `text` argument literally (no tmux key expansion).
+//!   Use `send_keys_raw` when key names like `C-c` are required.
+//! - Isolated test servers (`IsolatedTmux`) are guaranteed to be torn down on drop
+//!   even if the test panics, preventing socket leaks.
+//! - `TmuxBatch::execute` is fire-and-forget at the individual command level —
+//!   a failure in any batched command may not be distinguishable from others.
+//! - Numeric session names are always referenced with a trailing `:` to prevent
+//!   misinterpretation as window indices by tmux.
+//!
+//! ## Evals
+//!
+//! - `empty_batch_noop`: empty `TmuxBatch::execute()` → `Ok(())` without invoking tmux.
+//! - `batch_tracks_count`: after two `add()` calls, `len() == 2` and `is_empty() == false`.
+//! - `kill_pane_guards_last_pane`: calling `kill_pane` on the only pane in the only window
+//!   → `Err` containing "refusing to kill pane".
+//! - `new_window_numeric_session`: `new_window("0", cwd)` uses target `"0:"` and succeeds
+//!   without "index 0 in use" error.
+//! - `send_keys_literal`: text containing tmux special chars (e.g. `q`, `C-c`) is sent
+//!   as-is and not interpreted as key sequences.
+//! - `auto_start_creates_session`: with no server running, `auto_start` creates a session
+//!   and returns a non-empty pane ID.
+//! - `auto_start_creates_window`: with an existing session, `auto_start` adds a window
+//!   rather than a new session.
+//! - `stash_pane_fallback`: when `join_pane` fails (pane too small), `stash_pane`
+//!   calls `break_pane_to_stash` and names the overflow window "stash".
+//! - `isolated_tmux_cleanup`: dropping `IsolatedTmux` kills the server; subsequent
+//!   `running()` on the same socket returns `false`.
+//! - `pane_alive_false_for_unknown`: `pane_alive("%999")` returns `false` without panic.
+//! - `list_panes_ordered_by_position`: panes with smaller `pane_left`/`pane_top` values
+//!   appear earlier in the result of `list_panes_ordered`.
+//! - `dump_tmux_tree_format`: output contains session name, attach state, window name,
+//!   pane IDs, and running commands in a nested indented structure.
 
 use anyhow::{Context, Result};
 use std::path::Path;
@@ -94,7 +193,6 @@ impl Tmux {
             .cmd()
             .args([
                 "new-window",
-                "-a",
                 "-t",
                 &target,
                 "-c",
@@ -247,8 +345,33 @@ impl Tmux {
         Ok(())
     }
 
-    /// Kill a tmux pane.
+    /// Kill a tmux pane with safety guards.
+    ///
+    /// Refuses to kill if:
+    /// - The pane is the only pane in its window AND the window is the last in its session
+    ///   (killing would destroy the entire session)
+    ///
+    /// Returns an error instead of risking session destruction.
     pub fn kill_pane(&self, pane_id: &str) -> Result<()> {
+        // Guard: check if killing this pane would destroy the session
+        if let Ok(window_id) = self.pane_window(pane_id) {
+            let panes = self.list_window_panes(&window_id).unwrap_or_default();
+            if panes.len() <= 1 {
+                // This is the last pane in its window — killing it destroys the window.
+                // Check if this is the last window in the session.
+                if let Ok(session_name) = self.pane_session(pane_id) {
+                    let window_count = self.session_window_count(&session_name);
+                    if window_count <= 1 {
+                        anyhow::bail!(
+                            "refusing to kill pane {} — it is the last pane in the last window of session '{}'; \
+                             killing would destroy the entire session",
+                            pane_id, session_name
+                        );
+                    }
+                }
+            }
+        }
+
         let status = self
             .cmd()
             .args(["kill-pane", "-t", pane_id])
@@ -258,6 +381,28 @@ impl Tmux {
             anyhow::bail!("tmux kill-pane failed for {}", pane_id);
         }
         Ok(())
+    }
+
+    /// Count the number of windows in a session.
+    pub fn session_window_count(&self, session_name: &str) -> usize {
+        let output = match self
+            .cmd()
+            .args([
+                "list-windows",
+                "-t",
+                &format!("{}:", session_name),
+                "-F",
+                "#{window_id}",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return 0,
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count()
     }
 
     /// Get the window ID that contains a pane.
@@ -380,6 +525,34 @@ impl Tmux {
             anyhow::bail!("tmux resize-pane failed for pane {}", pane_id);
         }
         Ok(())
+    }
+
+    /// Query the height (rows) of a tmux window.
+    pub fn window_height(&self, window_id: &str) -> Result<usize> {
+        let output = self
+            .cmd()
+            .args(["display-message", "-t", window_id, "-p", "#{window_height}"])
+            .output()
+            .context("failed to run tmux display-message")?;
+        if !output.status.success() {
+            anyhow::bail!("tmux display-message failed for window {}", window_id);
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        s.parse::<usize>().with_context(|| format!("invalid window height: {:?}", s))
+    }
+
+    /// Query the height (rows) of a tmux pane.
+    pub fn pane_height(&self, pane_id: &str) -> Result<usize> {
+        let output = self
+            .cmd()
+            .args(["display-message", "-t", pane_id, "-p", "#{pane_height}"])
+            .output()
+            .context("failed to run tmux display-message")?;
+        if !output.status.success() {
+            anyhow::bail!("tmux display-message failed for pane {}", pane_id);
+        }
+        let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        s.parse::<usize>().with_context(|| format!("invalid pane height: {:?}", s))
     }
 
     /// Apply a named layout to a window (e.g., "even-horizontal", "tiled").
@@ -547,9 +720,8 @@ impl Tmux {
             match self.join_pane(pane_id, &target, "-dv") {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    eprintln!("[stash] join-pane {} → {} failed ({}), killing pane to prevent orphan window", pane_id, target, e);
-                    let _ = self.kill_pane(pane_id);
-                    Ok(())
+                    eprintln!("[stash] join-pane {} → {} failed ({}), breaking to overflow stash", pane_id, target, e);
+                    self.break_pane_to_stash(pane_id, session_name)
                 }
             }
         } else {

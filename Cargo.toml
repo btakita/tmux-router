@@ -1,6 +1,6 @@
 [package]
 name = "tmux-router"
-version = "0.2.9"
+version = "0.3.0"
 edition = "2024"
 description = "Declarative tmux pane routing — sync editor layouts to tmux"
 license = "MIT"
@@ -15,5 +15,7 @@ serde_json = "1"
 fs2 = "0.4"
 
 [dev-dependencies]
-tempfile = "3"
+existence = { path = "../existence-lang/existence" }
+module-harness = { path = "../module-harness" }
 proptest = "1"
+tempfile = "3"

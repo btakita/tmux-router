@@ -1,23 +1,88 @@
-//! Declarative tmux pane routing — 2D layout sync.
+//! # Module: sync
 //!
-//! Mirror a columnar editor layout in tmux pane arrangements.
+//! Declarative tmux pane routing — reconcile a 2D columnar file layout into
+//! a matching tmux pane arrangement within a single session boundary.
 //!
-//! Usage (as library):
-//! ```ignore
-//! use tmux_router::{Tmux, sync, FileResolution};
-//! sync(
-//!     &col_args,
-//!     Some("@1"),
-//!     Some("plan.md"),
-//!     &tmux,
-//!     Path::new(".tmux-router/registry.json"),
-//!     &|path| { /* your file resolution logic */ },
-//! )?;
-//! ```
+//! ## Spec
+//!
+//! - Layout is specified as `--col` arguments: each arg is a comma-separated
+//!   list of file paths forming one column (top-to-bottom). Columns are
+//!   arranged left-to-right.
+//! - Each file is resolved through a caller-supplied callback to either a
+//!   registered pane ID (`FileResolution::Registered`) or skipped
+//!   (`FileResolution::Unmanaged`).
+//! - Resolution falls back in three tiers: (1) registry lookup by key,
+//!   (2) in-memory donor from the same column (ephemeral, not persisted),
+//!   (3) spare unassigned pane in the target window.
+//! - All pane-moving operations (join, swap, break) are guarded by
+//!   `SessionScope` to prevent cross-session pane movement.
+//! - Reconciliation follows an attach-first order: ATTACH missing panes →
+//!   SELECT focus → DETACH unwanted → REORDER if needed → VERIFY.
+//!   This order prevents tmux from auto-selecting an unintended pane when
+//!   stashing occurs.
+//! - A 1-in/1-out replacement uses an atomic `swap-pane` fast path to avoid
+//!   visual flicker.
+//! - After layout stabilises, `equalize_sizes` distributes pane space evenly
+//!   (50/50 for 2 columns, `even-horizontal` for 3+, percentage-split per column).
+//! - `stash_overflow_panes` removes trailing panes (column-last, non-focus) when
+//!   any pane falls below `MIN_PANE_HEIGHT` (10 rows). Vertical overflow is
+//!   trimmed first; horizontal overflow (too many columns) is trimmed next.
+//! - Registry is updated for every pane touched during reconciliation; registry
+//!   errors are non-fatal warnings.
+//! - `SyncLog` records every phase operation with pass/fail status; errors do
+//!   not abort the sync but are surfaced via `has_errors()`.
+//!
+//! ## Agentic Contracts
+//!
+//! - `sync` — given valid col args and a live tmux server, returns `SyncResult`
+//!   containing the target session, target window, and file-to-pane mapping.
+//!   Never panics on dead panes or missing registry entries; all such cases
+//!   produce log warnings and continue.
+//! - `reconcile` — pure layout reconciler; callers may call it directly when
+//!   they already have resolved `pane_columns`. Returns `SyncLog` for assertion
+//!   in tests. Does not resize panes.
+//! - `equalize_sizes` — idempotent; safe to call repeatedly. Side-effects are
+//!   confined to tmux resize commands on the provided pane IDs.
+//! - `find_best_window` — read-only; queries tmux state to find the window
+//!   (within `target_session`) that already contains the most wanted panes.
+//!   Returns an empty string if no suitable window is found.
+//! - `find_column_pane` — pure lookup; returns the first live pane in the same
+//!   column as `file`, or `None` if no column-mate is resolved yet.
+//! - `SessionScope::contains` — returns `true` when no session constraint is
+//!   set; never performs tmux mutations.
+//! - `SessionScope::join_pane` / `swap_pane` — return `Ok(false)` (not `Err`)
+//!   when the scope blocks the operation; `Err` is reserved for tmux failures.
+//! - `SessionScope::verify_boundary` — read-only post-condition check; logs
+//!   `SCOPE_VIOLATION` errors for any out-of-session panes but does not remove
+//!   them.
+//! - `Layout::parse` — returns `Err` on empty col arg or zero columns; valid
+//!   input always produces a non-empty `Layout`.
+//!
+//! ## Evals
+//!
+//! - `fast_path`: layout already matches desired order → zero mutations, returns immediately
+//! - `swap_atomic`: exactly one pane in, one pane out → `swap-pane` used, no join/stash cycle
+//! - `attach_detach_order`: missing panes joined before unwanted panes stashed → focus pane never loses selection during stash
+//! - `reorder`: correct panes present but wrong order → break + rejoin restores desired order
+//! - `cross_session_blocked`: `--window` in session B while wanted panes are in session A → window arg silently ignored, session A used
+//! - `scope_block_join`: joining pane from foreign session → `Ok(false)` returned, operation skipped, no panic
+//! - `overflow_vertical`: window too short for all stacked panes → trailing non-focus panes stashed until all remaining meet `MIN_PANE_HEIGHT`
+//! - `overflow_horizontal`: too many columns for window width → last-column non-focus panes stashed until panes fit
+//! - `dead_pane_skip`: registered pane ID is dead → pane skipped with warning, remaining panes reconciled normally
+//! - `in_memory_donor`: unresolved file has a column-mate with a live pane → ephemeral assignment used, registry unchanged
+//! - `spare_pane_assign`: unresolved file has no column-mate but target window has unassigned pane → spare pane assigned ephemerally
+//! - `single_file_no_window`: one file, no `--window` → pane focused, no layout rearrangement
+//! - `non_managed_focus`: `--focus` points to unmanaged file → tmux selection preserved as-is
+//! - `registry_update_nonfatal`: registry write fails after pane move → sync completes, warning logged, `SyncLog::has_errors()` false (registry is advisory)
 
 use anyhow::Result;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+/// Minimum pane height (rows) for a usable Claude Code session.
+/// Below this, panes are too small to display meaningful output.
+/// When a window can't fit all panes at this height, overflow panes are stashed.
+pub const MIN_PANE_HEIGHT: usize = 10;
 
 use crate::registry;
 use crate::tmux::Tmux;
@@ -138,6 +203,116 @@ impl SyncLog {
             .iter()
             .filter(|e| matches!(e.phase, "DETACH" | "ATTACH" | "REORDER"))
             .count()
+    }
+}
+
+// =========================================================================
+// SessionScope — session boundary enforcement
+// =========================================================================
+
+/// Enforces tmux session boundaries for pane operations.
+/// All pane-moving operations (join, swap, break) go through this scope
+/// to prevent cross-session pane movement.
+pub struct SessionScope<'a> {
+    tmux: &'a Tmux,
+    session: Option<&'a str>,
+}
+
+impl<'a> SessionScope<'a> {
+    pub fn new(tmux: &'a Tmux, session: Option<&'a str>) -> Self {
+        Self { tmux, session }
+    }
+
+    /// Check if a pane belongs to this scope's session.
+    /// Returns true if no session constraint or pane is in the right session.
+    pub fn contains(&self, pane: &str) -> bool {
+        match self.session {
+            None => true,
+            Some(expected) => self
+                .tmux
+                .pane_session(pane)
+                .map(|s| s == expected)
+                .unwrap_or(false),
+        }
+    }
+
+    /// Join a pane into a target, with session boundary check.
+    /// Returns Ok(true) if joined, Ok(false) if blocked, Err on tmux failure.
+    pub fn join_pane(
+        &self,
+        src: &str,
+        dst: &str,
+        flag: &str,
+        log: &mut SyncLog,
+    ) -> Result<bool> {
+        if !self.contains(src) {
+            let actual = self.tmux.pane_session(src).unwrap_or_default();
+            log.log(
+                "SCOPE_BLOCK",
+                format!(
+                    "join blocked: pane {} in session '{}', scope is '{}'",
+                    src,
+                    actual,
+                    self.session.unwrap_or("*")
+                ),
+            );
+            return Ok(false);
+        }
+        self.tmux.join_pane(src, dst, flag)?;
+        Ok(true)
+    }
+
+    /// Swap two panes, with session boundary check on both.
+    /// Returns Ok(true) if swapped, Ok(false) if blocked, Err on tmux failure.
+    pub fn swap_pane(
+        &self,
+        a: &str,
+        b: &str,
+        log: &mut SyncLog,
+    ) -> Result<bool> {
+        if !self.contains(a) || !self.contains(b) {
+            let a_sess = self.tmux.pane_session(a).unwrap_or_default();
+            let b_sess = self.tmux.pane_session(b).unwrap_or_default();
+            log.log(
+                "SCOPE_BLOCK",
+                format!(
+                    "swap blocked: {} in '{}', {} in '{}', scope is '{}'",
+                    a,
+                    a_sess,
+                    b,
+                    b_sess,
+                    self.session.unwrap_or("*")
+                ),
+            );
+            return Ok(false);
+        }
+        self.tmux.swap_pane(a, b)?;
+        Ok(true)
+    }
+
+    /// Verify post-condition: all panes in the window belong to this session.
+    /// Logs SCOPE_VIOLATION for any pane that crossed the boundary.
+    pub fn verify_boundary(&self, window: &str, log: &mut SyncLog) -> bool {
+        let session = match self.session {
+            Some(s) => s,
+            None => return true,
+        };
+        let panes = self.tmux.list_window_panes(window).unwrap_or_default();
+        let mut ok = true;
+        for pane in &panes {
+            if !self.contains(pane) {
+                let actual = self.tmux.pane_session(pane).unwrap_or_default();
+                log.log_err(
+                    "SCOPE_VIOLATION",
+                    format!(
+                        "pane {} in window {} belongs to session '{}', expected '{}'",
+                        pane, window, actual, session
+                    ),
+                );
+                ok = false;
+            }
+        }
+        ok
     }
 }
 
@@ -490,47 +665,61 @@ pub fn sync(
         .collect();
 
     // --- Phase 4: Pick target window (same tmux session only) ---
+    // Derive target_session from wanted panes FIRST, then validate --window against it.
+    // This prevents cross-session pane movement when --window is in a different session.
+    let wanted_session: Option<String> = wanted.iter().find_map(|p| tmux.pane_session(p).ok());
+
     let target_session = if let Some(ref ts) = doc_tmux_session {
         if tmux.session_alive(ts) {
             Some(ts.clone())
         } else {
             eprintln!(
-                "warning: configured tmux_session '{}' is dead, falling back to --window",
+                "warning: configured tmux_session '{}' is dead, falling back",
                 ts
             );
-            if let Some(w) = window {
-                tmux.pane_session(w).ok()
-            } else {
-                wanted.iter().find_map(|p| tmux.pane_session(p).ok())
-            }
+            wanted_session.clone().or_else(|| window.and_then(|w| tmux.pane_session(w).ok()))
         }
-    } else if let Some(w) = window {
-        tmux.pane_session(w).ok()
     } else {
-        wanted.iter().find_map(|p| tmux.pane_session(p).ok())
+        // Prefer wanted panes' session, fall back to --window only if no wanted panes exist
+        wanted_session.clone().or_else(|| window.and_then(|w| tmux.pane_session(w).ok()))
     };
-    eprintln!("target_session={:?}", target_session);
+    eprintln!("target_session={:?} (wanted_session={:?})", target_session, wanted_session);
 
-    // If --window is alive, use it directly (stable, deterministic).
-    // Only search for best_window when --window is missing or dead.
-    let target_window = if let Some(w) = window {
-        if !tmux.list_window_panes(w).unwrap_or_default().is_empty() {
-            eprintln!("target_window={} (from --window)", w);
-            w.to_string()
-        } else {
-            eprintln!("warning: --window {} is dead, searching for best window", w);
-            find_best_window(tmux, &wanted, target_session.as_deref())
+    // Validate --window against target_session. If --window is in a different session,
+    // ignore it to prevent cross-session pane movement.
+    let validated_window: Option<&str> = window.and_then(|w| {
+        if tmux.list_window_panes(w).unwrap_or_default().is_empty() {
+            eprintln!("warning: --window {} is dead, ignoring", w);
+            return None;
         }
+        if let Some(ref ts) = target_session {
+            match tmux.pane_session(w) {
+                Ok(ws) if ws == *ts => Some(w),
+                Ok(ws) => {
+                    eprintln!("warning: --window {} is in session '{}', but target is '{}' — ignoring", w, ws, ts);
+                    None
+                }
+                Err(_) => None,
+            }
+        } else {
+            Some(w)
+        }
+    });
+
+    let target_window = if let Some(w) = validated_window {
+        eprintln!("target_window={} (from --window)", w);
+        w.to_string()
     } else {
         find_best_window(tmux, &wanted, target_session.as_deref())
     };
 
     let anchor_pane = pane_columns[0][0].clone();
 
-    let desired_ordered: Vec<&str> = pane_columns
+    let desired_ordered: Vec<String> = pane_columns
         .iter()
-        .flat_map(|col| col.iter().map(|s| s.as_str()))
+        .flat_map(|col| col.iter().cloned())
         .collect();
+    let desired_ordered_refs: Vec<&str> = desired_ordered.iter().map(|s| s.as_str()).collect();
 
     // Resolve --focus to a pane ID (Option: None preserves current tmux selection)
     let focus_pane: Option<String> = if let Some(focus_file) = focus {
@@ -554,7 +743,7 @@ pub fn sync(
         tmux,
         &target_window,
         &pane_columns,
-        &desired_ordered,
+        &desired_ordered_refs,
         target_session.as_deref(),
         focus_pane.as_deref(),
         registry_path,
@@ -562,8 +751,18 @@ pub fn sync(
 
     // --- Phase 6: Resize + re-select ---
     equalize_sizes(tmux, &pane_columns);
+
+    // --- Phase 6.5: Overflow stash ---
+    // After equalize, check if any pane is below MIN_PANE_HEIGHT.
+    // If so, stash overflow panes (last column first) until all remaining fit.
+    if let Some(ref session) = target_session {
+        stash_overflow_panes(tmux, &mut pane_columns, session, &target_window, focus_pane.as_deref());
+    }
+
     if let Some(ref fp) = focus_pane {
-        tmux.select_pane(fp)?;
+        if tmux.pane_alive(fp) {
+            tmux.select_pane(fp)?;
+        }
     }
     let sel = target_session.as_deref().and_then(|s| tmux.active_pane(s)).unwrap_or_default();
     eprintln!("phase6: focus={:?}, selected={}", focus_pane, sel);
@@ -622,6 +821,7 @@ pub fn reconcile(
     registry_path: &Path,
 ) -> Result<SyncLog> {
     let mut log = SyncLog::new();
+    let scope = SessionScope::new(tmux, session_name);
 
     let wanted: HashSet<&str> = desired_ordered.iter().copied().collect();
     let first_pane = desired_ordered[0];
@@ -663,20 +863,22 @@ pub fn reconcile(
         let incoming = to_attach[0];
         let outgoing = to_detach[0];
 
-        // Only swap if the incoming pane is alive (exists somewhere)
+        // Only swap if the incoming pane is alive and SessionScope allows it
         if tmux.pane_window(incoming).is_ok() {
-            match tmux.swap_pane(incoming, outgoing) {
-                Ok(()) => {
+            match scope.swap_pane(incoming, outgoing, &mut log) {
+                Ok(true) => {
                     log.log("SWAP", format!("{} ↔ {} (atomic)", incoming, outgoing));
                     update_registry(tmux, incoming, registry_path, &mut log);
                     update_registry(tmux, outgoing, registry_path, &mut log);
 
-                    // Select focus pane
                     let select_target = focus_pane.unwrap_or(first_pane);
                     let _ = tmux.select_pane(select_target);
                     log.log("SELECT", format!("focused {}", select_target));
 
                     return Ok(log);
+                }
+                Ok(false) => {
+                    // Scope blocked the swap — fall through to ATTACH/DETACH
                 }
                 Err(e) => {
                     log.log_err("SWAP", format!("swap-pane failed ({} ↔ {}): {}, falling back to join+stash", incoming, outgoing, e));
@@ -686,17 +888,18 @@ pub fn reconcile(
         }
     }
 
-    // --- ATTACH missing desired panes ---
+    // --- ATTACH missing desired panes (all guarded by SessionScope) ---
     // First, ensure the first desired pane is in the target window.
     if !current_set.contains(first_pane) {
         let existing = tmux.list_window_panes(target_window).unwrap_or_default();
         if let Some(target) = existing.first() {
             let flag = first_pane_join_flag(pane_columns, target);
-            match tmux.join_pane(first_pane, target, flag) {
-                Ok(()) => {
+            match scope.join_pane(first_pane, target, flag, &mut log) {
+                Ok(true) => {
                     log.log("ATTACH", format!("joined first {} into {} ({})", first_pane, target_window, flag));
                     update_registry(tmux, first_pane, registry_path, &mut log);
                 }
+                Ok(false) => {} // scope blocked — logged by scope
                 Err(e) => {
                     log.log_err("ATTACH", format!("failed to join first {}: {}", first_pane, e));
                 }
@@ -722,11 +925,12 @@ pub fn reconcile(
                 continue;
             }
             let (target_pane, flag) = join_target(pane_columns, col_idx, row_idx);
-            match tmux.join_pane(pane, &target_pane, flag) {
-                Ok(()) => {
+            match scope.join_pane(pane, &target_pane, flag, &mut log) {
+                Ok(true) => {
                     log.log("ATTACH", format!("{} → {} ({})", pane, target_pane, flag));
                     update_registry(tmux, pane, registry_path, &mut log);
                 }
+                Ok(false) => {} // scope blocked
                 Err(e) => {
                     log.log_err("ATTACH", format!("failed to join {} → {}: {}", pane, target_pane, e));
                 }
@@ -758,6 +962,23 @@ pub fn reconcile(
         if window_count <= 1 {
             log.log("DETACH", format!("skipped {} — last pane in window", pane));
             continue;
+        }
+        // Cross-session check: skip if pane is registered to another session
+        if let Some(sess) = session_name {
+            if let Ok(reg) = registry::load_registry(registry_path) {
+                let owned_by_other = reg.values().any(|entry| {
+                    entry.pane == *pane && !entry.window.is_empty() && {
+                        // Check if this pane's registered window belongs to a different session
+                        tmux.pane_session(pane)
+                            .map(|s| s != sess)
+                            .unwrap_or(false)
+                    }
+                });
+                if owned_by_other {
+                    log.log("DETACH", format!("skipped {} — registered to another session", pane));
+                    continue;
+                }
+            }
         }
         let (result, verb) = if let Some(sess) = session_name {
             (tmux.stash_pane(pane, sess), "stashed")
@@ -846,6 +1067,11 @@ pub fn reconcile(
         );
     }
 
+    // --- POST-CONDITION: session boundary invariant ---
+    // Every pane in the target window must belong to the scoped session.
+    // This catches any code path that bypassed SessionScope guards.
+    scope.verify_boundary(target_window, &mut log);
+
     // --- REGISTRY UPDATE for all wanted panes ---
     for pane in desired_ordered {
         update_registry(tmux, pane, registry_path, &mut log);
@@ -933,6 +1159,126 @@ pub fn equalize_sizes(tmux: &Tmux, pane_columns: &[Vec<String>]) {
             let pct = 100 / col.len() as u32;
             let _ = tmux.resize_pane(&col[0], "-y", pct);
         }
+    }
+}
+
+/// Stash overflow panes when the window is too small.
+///
+/// After equalize_sizes, checks actual pane heights. If any pane is below
+/// MIN_PANE_HEIGHT, stashes panes until all remaining panes meet the minimum.
+/// Two overflow modes:
+/// 1. Vertical overflow — too many panes stacked in a column
+/// 2. Horizontal overflow — too many columns cause undersized panes
+/// Preserves the focus pane.
+fn stash_overflow_panes(
+    tmux: &Tmux,
+    pane_columns: &mut Vec<Vec<String>>,
+    session_name: &str,
+    target_window: &str,
+    focus_pane: Option<&str>,
+) {
+    let win_height = match tmux.window_height(target_window) {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+
+    let total_panes: usize = pane_columns.iter().map(|c| c.len()).sum();
+    if total_panes <= 1 {
+        return; // Can't stash the last pane
+    }
+
+    // Calculate max panes per column that fit at MIN_PANE_HEIGHT.
+    // Pane separators cost 1 row each.
+    let max_panes_per_col = if win_height >= MIN_PANE_HEIGHT {
+        (win_height + 1) / (MIN_PANE_HEIGHT + 1)
+    } else {
+        1 // Window too small even for one pane at min height, keep 1
+    };
+
+    // Check for undersized panes (covers both vertical and horizontal overflow)
+    let has_undersized = pane_columns.iter().flat_map(|c| c.iter()).any(|pane| {
+        tmux.pane_height(pane).unwrap_or(MIN_PANE_HEIGHT) < MIN_PANE_HEIGHT
+    });
+
+    let needs_vertical_stash = pane_columns.iter().any(|col| col.len() > max_panes_per_col);
+
+    if !needs_vertical_stash && !has_undersized {
+        return;
+    }
+
+    eprintln!(
+        "[overflow] window {} height={}, max_panes_per_col={}, stashing overflow (vertical={}, undersized={})",
+        target_window, win_height, max_panes_per_col, needs_vertical_stash, has_undersized
+    );
+
+    let focus_set: HashSet<&str> = focus_pane.into_iter().collect();
+    let mut stashed = 0;
+
+    // Phase 1: Vertical overflow — trim columns that exceed max_panes_per_col
+    for col in pane_columns.iter_mut().rev() {
+        while col.len() > max_panes_per_col {
+            let stash_idx = col.iter().rposition(|p| !focus_set.contains(p.as_str()));
+            let stash_idx = match stash_idx {
+                Some(i) => i,
+                None => break,
+            };
+            let pane_id = col.remove(stash_idx);
+            eprintln!("[overflow] stashing pane {} (vertical overflow)", pane_id);
+            if let Err(e) = tmux.stash_pane(&pane_id, session_name) {
+                eprintln!("[overflow] stash failed for {}: {}", pane_id, e);
+            }
+            stashed += 1;
+        }
+    }
+
+    // Phase 2: Horizontal overflow — stash entire columns from the back
+    // when panes are still undersized after vertical trimming.
+    // Keep stashing last-column panes until only 1 column remains or panes fit.
+    while pane_columns.len() > 1 {
+        // Re-check: are any panes still undersized?
+        let still_undersized = pane_columns.iter().flat_map(|c| c.iter()).any(|pane| {
+            tmux.pane_height(pane).unwrap_or(MIN_PANE_HEIGHT) < MIN_PANE_HEIGHT
+        });
+        if !still_undersized {
+            break;
+        }
+
+        // Find the last column that has a non-focus pane to stash
+        let col_idx = pane_columns.iter().rposition(|col| {
+            col.iter().any(|p| !focus_set.contains(p.as_str()))
+        });
+        let col_idx = match col_idx {
+            Some(i) => i,
+            None => break, // Only focus panes remain
+        };
+
+        // Stash one non-focus pane from this column
+        let col = &mut pane_columns[col_idx];
+        let stash_idx = col.iter().rposition(|p| !focus_set.contains(p.as_str()));
+        if let Some(idx) = stash_idx {
+            let pane_id = col.remove(idx);
+            eprintln!("[overflow] stashing pane {} (horizontal overflow)", pane_id);
+            if let Err(e) = tmux.stash_pane(&pane_id, session_name) {
+                eprintln!("[overflow] stash failed for {}: {}", pane_id, e);
+            }
+            stashed += 1;
+
+            // After stashing, re-equalize so pane heights update
+            pane_columns.retain(|col| !col.is_empty());
+            if !pane_columns.is_empty() {
+                equalize_sizes(tmux, pane_columns);
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Remove empty columns
+    pane_columns.retain(|col| !col.is_empty());
+
+    if stashed > 0 {
+        eprintln!("[overflow] stashed {} pane(s) total", stashed);
+        equalize_sizes(tmux, pane_columns);
     }
 }
 
@@ -3103,5 +3449,303 @@ mod tests {
         assert!(has_a, "file_a should be in file_panes");
         assert!(has_b, "file_b should be in file_panes");
         assert!(has_c, "file_c (column donor) should be in file_panes");
+    }
+
+    // --- Cross-session swap prevention tests ---
+
+    #[test]
+    fn test_swap_pane_validates_same_session() {
+        // When incoming pane is in a different session, the SWAP fast path
+        // should be skipped and join+stash fallback used instead.
+        let t = IsolatedTmux::new("sync-test-cross-session-swap");
+        let tmp = TempDir::new().unwrap();
+
+        // Create session "main" with pane A in target window, and pane X (unwanted) via split
+        let pane_a = t.new_session("main", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let pane_x = t
+            .raw_cmd(&[
+                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+            ])
+            .unwrap();
+
+        // Create session "other" with pane B (the one we want to bring in)
+        let pane_b = t.new_session("other", tmp.path()).unwrap();
+
+        // Verify pane_b is in "other" session
+        let b_session = t.pane_session(&pane_b).unwrap();
+        assert_eq!(b_session, "other", "pane_b should be in 'other' session");
+
+        // Desired: [A, B] replacing X — this is a 1:1 swap scenario
+        let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
+
+        // Pass session_name="main" so the session validation kicks in
+        let log = reconcile(
+            &t, &target_window, &pane_columns, &desired,
+            Some("main"), None, &dummy_registry_path(),
+        ).unwrap();
+
+        // The SWAP fast path should have been SKIPPED (cross-session)
+        let has_swap_skip = log.entries().iter().any(|e| e.phase == "SCOPE_BLOCK");
+        let has_swap = log.entries().iter().any(|e| e.phase == "SWAP" && e.ok);
+        assert!(
+            has_swap_skip,
+            "should log SCOPE_BLOCK for cross-session swap attempt, got: {:?}",
+            log.entries()
+        );
+        assert!(
+            !has_swap,
+            "SWAP should NOT succeed when panes are in different sessions"
+        );
+
+        // The join fallback should ALSO be blocked (cross-session)
+        let has_attach_skip = log.entries().iter().any(|e| e.phase == "SCOPE_BLOCK");
+        assert!(
+            has_attach_skip,
+            "should log SCOPE_BLOCK for cross-session join attempt, got: {:?}",
+            log.entries()
+        );
+
+        // B should NOT be in the target window (cross-session join prevented)
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert!(final_panes.contains(&pane_a), "A should remain in target");
+        assert!(!final_panes.contains(&pane_b), "B should NOT be joined from different session");
+    }
+
+    #[test]
+    fn test_swap_same_session_uses_fast_path() {
+        // When both panes are in the same session, SWAP fast path should be used.
+        let t = IsolatedTmux::new("sync-test-same-session-swap");
+        let tmp = TempDir::new().unwrap();
+
+        // Create session with A and X in target window, B in separate window
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let pane_x = t
+            .raw_cmd(&[
+                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+            ])
+            .unwrap();
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+
+        // Desired: [A, B] replacing X — 1:1 swap, all in "test" session
+        let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
+
+        let log = reconcile(
+            &t, &target_window, &pane_columns, &desired,
+            Some("test"), None, &dummy_registry_path(),
+        ).unwrap();
+
+        // SWAP fast path should be used (same session)
+        let has_swap = log.entries().iter().any(|e| e.phase == "SWAP" && e.ok);
+        let has_swap_skip = log.entries().iter().any(|e| e.phase == "SCOPE_BLOCK");
+        assert!(
+            has_swap,
+            "SWAP should succeed when all panes are in the same session, got: {:?}",
+            log.entries()
+        );
+        assert!(!has_swap_skip, "should NOT skip swap for same-session panes");
+
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert!(final_panes.contains(&pane_a));
+        assert!(final_panes.contains(&pane_b));
+    }
+
+    #[test]
+    fn test_swap_no_session_constraint_allows_swap() {
+        // When session_name is None, SWAP fast path should work unconditionally.
+        let t = IsolatedTmux::new("sync-test-no-session-swap");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let pane_x = t
+            .raw_cmd(&[
+                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+            ])
+            .unwrap();
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+
+        let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
+
+        // session_name = None — no constraint
+        let log = reconcile(
+            &t, &target_window, &pane_columns, &desired,
+            None, None, &dummy_registry_path(),
+        ).unwrap();
+
+        let has_swap = log.entries().iter().any(|e| e.phase == "SWAP" && e.ok);
+        assert!(has_swap, "SWAP should work with no session constraint: {:?}", log.entries());
+    }
+
+    #[test]
+    fn test_cross_session_join_blocked_entirely() {
+        // When a pane is in session "other" and session_name="main",
+        // BOTH swap and join paths should be blocked.
+        let t = IsolatedTmux::new("sync-test-cross-session-join-blocked");
+        let tmp = TempDir::new().unwrap();
+
+        // Session "main" with pane A
+        let pane_a = t.new_session("main", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+
+        // Session "other" with pane B
+        let pane_b = t.new_session("other", tmp.path()).unwrap();
+
+        // Desired: [A, B] — B is in wrong session, should be completely blocked
+        let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
+
+        let log = reconcile(
+            &t, &target_window, &pane_columns, &desired,
+            Some("main"), None, &dummy_registry_path(),
+        ).unwrap();
+
+        // Verify cross-session join was blocked
+        let has_attach_skip = log.entries().iter().any(|e| e.phase == "SCOPE_BLOCK");
+        assert!(
+            has_attach_skip,
+            "should log SCOPE_BLOCK for cross-session join, got: {:?}",
+            log.entries()
+        );
+
+        // B must NOT be in target window
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert!(final_panes.contains(&pane_a), "A should remain");
+        assert!(!final_panes.contains(&pane_b), "B must not cross session boundary");
+
+        // B should still be in "other" session (not moved)
+        let b_session = t.pane_session(&pane_b).unwrap();
+        assert_eq!(b_session, "other", "B should remain in 'other' session");
+    }
+
+    // ── Overflow stash tests ──
+
+    #[test]
+    fn test_overflow_stash_when_window_too_small() {
+        // When window height is too small for 2 columns of panes,
+        // stash_overflow_panes should move excess panes to stash.
+        let t = IsolatedTmux::new("sync-test-overflow-stash");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        // Make window tall enough for initial setup
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "40"]);
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+
+        // Sync both panes into one window
+        let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![&pane_a, &pane_b];
+        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path()).unwrap();
+        equalize_sizes(&t, &cols);
+
+        // Both should be in the window
+        let panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(panes.len(), 2, "should have 2 panes before shrink");
+
+        // Now shrink window to be too small for 2 columns
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-y", "8"]);
+
+        // Run overflow stash
+        let mut cols_mut = cols.clone();
+        stash_overflow_panes(&t, &mut cols_mut, "test", &target_window, Some(&pane_a));
+
+        // After overflow: one pane should be stashed (pane_b since pane_a is focus)
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(final_panes.len(), 1, "should have 1 pane after overflow stash, got {:?}", final_panes);
+        assert!(final_panes.contains(&pane_a), "focus pane A should remain");
+        assert!(t.pane_alive(&pane_b), "pane B should still be alive (stashed)");
+    }
+
+    #[test]
+    fn test_overflow_stash_preserves_focus_pane() {
+        // Even if the focus pane is in the last column, it should not be stashed.
+        let t = IsolatedTmux::new("sync-test-overflow-focus");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "40"]);
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+
+        let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![&pane_a, &pane_b];
+        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path()).unwrap();
+
+        // Shrink
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-y", "8"]);
+
+        // Focus is pane_b (right column)
+        let mut cols_mut = cols.clone();
+        stash_overflow_panes(&t, &mut cols_mut, "test", &target_window, Some(&pane_b));
+
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(final_panes.len(), 1, "should have 1 pane, got {:?}", final_panes);
+        assert!(final_panes.contains(&pane_b), "focus pane B should remain");
+        assert!(t.pane_alive(&pane_a), "pane A should still be alive (stashed)");
+    }
+
+    #[test]
+    fn test_no_overflow_when_window_large_enough() {
+        // When window is large enough, no panes should be stashed.
+        let t = IsolatedTmux::new("sync-test-no-overflow");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "40"]);
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+
+        let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
+        let desired: Vec<&str> = vec![&pane_a, &pane_b];
+        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path()).unwrap();
+        equalize_sizes(&t, &cols);
+
+        let mut cols_mut = cols.clone();
+        stash_overflow_panes(&t, &mut cols_mut, "test", &target_window, Some(&pane_a));
+
+        // No panes stashed — both should remain
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(final_panes.len(), 2, "both panes should remain when window is large enough");
+    }
+
+    #[test]
+    fn test_overflow_stash_vertical_stack() {
+        // Column with 3 vertically stacked panes in a 15-row window.
+        // Only 1 can fit at MIN_PANE_HEIGHT=10, so 2 should be stashed.
+        let t = IsolatedTmux::new("sync-test-overflow-vertical");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "40"]);
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+        let pane_c = t.new_window("test", tmp.path()).unwrap();
+
+        // Single column with 3 panes stacked
+        let cols = vec![vec![pane_a.clone(), pane_b.clone(), pane_c.clone()]];
+        let desired: Vec<&str> = vec![&pane_a, &pane_b, &pane_c];
+        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path()).unwrap();
+        equalize_sizes(&t, &cols);
+
+        // Shrink to 15 rows — only 1 pane can fit at MIN_PANE_HEIGHT=10
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-y", "15"]);
+
+        let mut cols_mut = cols.clone();
+        stash_overflow_panes(&t, &mut cols_mut, "test", &target_window, Some(&pane_a));
+
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(final_panes.len(), 1, "only 1 pane should fit in 15-row window, got {:?}", final_panes);
+        assert!(final_panes.contains(&pane_a), "focus pane A should remain");
+        assert!(t.pane_alive(&pane_b), "B still alive");
+        assert!(t.pane_alive(&pane_c), "C still alive");
     }
 }
