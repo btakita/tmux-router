@@ -140,6 +140,26 @@ impl Tmux {
         }
     }
 
+    /// Get all alive pane IDs in a single subprocess call.
+    /// Returns a HashSet for O(1) lookup. Use this instead of calling
+    /// `pane_alive()` per entry to avoid N subprocess calls.
+    pub fn alive_pane_ids(&self) -> std::collections::HashSet<String> {
+        let output = self
+            .cmd()
+            .args(["list-panes", "-a", "-F", "#{pane_id}"])
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect()
+            }
+            _ => std::collections::HashSet::new(),
+        }
+    }
+
     /// Check if a tmux server is running (has any sessions).
     pub fn running(&self) -> bool {
         self.cmd()

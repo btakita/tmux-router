@@ -208,8 +208,9 @@ pub fn prune(registry_path: &Path, tmux: &Tmux) -> Result<usize> {
     let mut registry = load_registry(registry_path)?;
     let before = registry.len();
 
-    // Remove dead panes
-    registry.retain(|_key, entry| tmux.pane_alive(&entry.pane));
+    // Remove dead panes — single subprocess call instead of N
+    let alive = tmux.alive_pane_ids();
+    registry.retain(|_key, entry| alive.contains(&entry.pane));
     let dead_removed = before - registry.len();
 
     // Deduplicate: if multiple keys point to the same pane, keep most recent
