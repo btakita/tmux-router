@@ -783,7 +783,7 @@ impl Tmux {
     /// Break a pane out and name the new window "stash" so it's tracked
     /// as part of the stash inventory. Used as fallback when join-pane
     /// to the primary stash window fails (pane too small).
-    pub fn break_pane_to_stash(&self, pane_id: &str, session_name: &str) -> Result<()> {
+    pub fn break_pane_to_stash(&self, pane_id: &str, _session_name: &str) -> Result<()> {
         // break-pane -d creates a new detached window
         self.break_pane(pane_id)?;
         // Find the window that now contains this pane and rename it to "stash"

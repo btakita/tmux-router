@@ -759,11 +759,8 @@ pub fn sync(
         stash_overflow_panes(tmux, &mut pane_columns, session, &target_window, focus_pane.as_deref());
     }
 
-    if let Some(ref fp) = focus_pane {
-        if tmux.pane_alive(fp) {
-            tmux.select_pane(fp)?;
-        }
-    }
+    if let Some(ref fp) = focus_pane
+        && tmux.pane_alive(fp) { tmux.select_pane(fp)?; }
     let sel = target_session.as_deref().and_then(|s| tmux.active_pane(s)).unwrap_or_default();
     eprintln!("phase6: focus={:?}, selected={}", focus_pane, sel);
 
@@ -964,20 +961,20 @@ pub fn reconcile(
             continue;
         }
         // Cross-session check: skip if pane is registered to another session
-        if let Some(sess) = session_name {
-            if let Ok(reg) = registry::load_registry(registry_path) {
-                let owned_by_other = reg.values().any(|entry| {
-                    entry.pane == *pane && !entry.window.is_empty() && {
-                        // Check if this pane's registered window belongs to a different session
-                        tmux.pane_session(pane)
-                            .map(|s| s != sess)
-                            .unwrap_or(false)
-                    }
-                });
-                if owned_by_other {
-                    log.log("DETACH", format!("skipped {} — registered to another session", pane));
-                    continue;
+        if let Some(sess) = session_name
+            && let Ok(reg) = registry::load_registry(registry_path)
+        {
+            let owned_by_other = reg.values().any(|entry| {
+                entry.pane == *pane && !entry.window.is_empty() && {
+                    // Check if this pane's registered window belongs to a different session
+                    tmux.pane_session(pane)
+                        .map(|s| s != sess)
+                        .unwrap_or(false)
                 }
+            });
+            if owned_by_other {
+                log.log("DETACH", format!("skipped {} — registered to another session", pane));
+                continue;
             }
         }
         let (result, verb) = if let Some(sess) = session_name {
@@ -1167,8 +1164,9 @@ pub fn equalize_sizes(tmux: &Tmux, pane_columns: &[Vec<String>]) {
 /// After equalize_sizes, checks actual pane heights. If any pane is below
 /// MIN_PANE_HEIGHT, stashes panes until all remaining panes meet the minimum.
 /// Two overflow modes:
-/// 1. Vertical overflow — too many panes stacked in a column
-/// 2. Horizontal overflow — too many columns cause undersized panes
+///    1. Vertical overflow — too many panes stacked in a column
+///    2. Horizontal overflow — too many columns cause undersized panes
+///
 /// Preserves the focus pane.
 fn stash_overflow_panes(
     tmux: &Tmux,
