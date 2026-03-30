@@ -162,7 +162,7 @@ tmux.send_keys_raw("%5", "C-c")?;
 
 - **Registry** (`.tmux-router/registry.json`) — maps file paths to pane IDs
 - **Layout reconciliation** — attach-first algorithm (ATTACH → SELECT → DETACH → REORDER → VERIFY)
-- **Stash window** — evicted panes collected in one place, not scattered
+- **Stash window** — evicted panes collected in one place, not scattered; early-exit paths stash excess panes to prevent leftovers from previous layouts
 - **Health management** — dead panes pruned, stale bindings cleaned up
 
 ## License
