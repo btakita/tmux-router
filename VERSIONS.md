@@ -1,5 +1,11 @@
 # Versions
 
+## 0.3.5 (2026-03-29)
+
+- Sync trace logging at key decision points (resolution summary, exit path, full reconcile entry)
+- Early-exit stash removed: preserves previous-column panes instead of stashing
+- Test updated: `test_sync_early_exit_preserves_other_panes`
+
 ## 0.3.4 (2026-03-29)
 
 - Early-exit stash now derives session from pane via `pane_session()` instead of `doc_tmux_session` (was always None = dead code)
