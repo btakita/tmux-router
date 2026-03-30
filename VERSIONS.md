@@ -11,6 +11,38 @@
 - Early-exit stash now derives session from pane via `pane_session()` instead of `doc_tmux_session` (was always None = dead code)
 - New test: `test_sync_early_exit_stash_derives_session_from_pane`
 
+## 0.3.3 (2026-03-30)
+
+- **Integration test**: Add test for early-exit excess pane stashing
+- **Docs**: Update README for early-exit stash behavior
+
+## 0.3.2 (2026-03-28)
+
+- **alive_pane_ids**: Bulk method for O(1) pane liveness checks
+- **Clippy fixes**: v0.3.1 cleanup
+
+## 0.3.0 (2026-03-25)
+
+- **kill_pane safety guards**: Cross-session check, prevent killing panes outside managed sessions
+- **Stash orphan fix**: `stash_pane` kills pane on join failure instead of creating orphan window
+
+## 0.2.9 (2026-03-24)
+
+- **swap_pane**: Atomic 1:1 pane replacement via `swap-pane`
+- **Focus-steal logging**: Diagnosis logging during detach/stash operations
+
+## 0.2.8 (2026-03-18)
+
+- **Numeric session fix**: Fix session name ambiguity in `new_window()` for numeric session names
+
+## 0.2.7 (2026-03-18)
+
+- **TmuxBatch**: Fire-and-forget command batching
+
+## 0.2.6 (2026-03-17)
+
+- **split_window**: Add `split_window` method to Tmux
+
 ## 0.2.5 (2026-03-17)
 
 - Improve `send_keys` timing (50ms → 100ms delay) and add session logging to `focus_pane`
