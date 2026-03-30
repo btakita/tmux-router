@@ -1,5 +1,10 @@
 # Versions
 
+## 0.3.4 (2026-03-29)
+
+- Early-exit stash now derives session from pane via `pane_session()` instead of `doc_tmux_session` (was always None = dead code)
+- New test: `test_sync_early_exit_stash_derives_session_from_pane`
+
 ## 0.2.5 (2026-03-17)
 
 - Improve `send_keys` timing (50ms → 100ms delay) and add session logging to `focus_pane`
