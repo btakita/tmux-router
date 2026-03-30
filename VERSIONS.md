@@ -2,9 +2,9 @@
 
 ## 0.3.5 (2026-03-29)
 
+- **No early exits**: Removed all early exits from `sync` — the full reconcile path now runs for 0, 1, or 2+ resolved panes uniformly. Previous early exits for `resolved < 2` bypassed the DETACH phase, leaving orphaned panes from previous layouts visible.
 - Sync trace logging at key decision points (resolution summary, exit path, full reconcile entry)
-- Early-exit stash removed: preserves previous-column panes instead of stashing
-- Test updated: `test_sync_early_exit_preserves_other_panes`
+- Test: `test_sync_single_resolved_stashes_excess` verifies 1-pane reconcile stashes excess
 
 ## 0.3.4 (2026-03-29)
 

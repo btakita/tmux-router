@@ -16,9 +16,10 @@
 //!   (3) spare unassigned pane in the target window.
 //! - All pane-moving operations (join, swap, break) are guarded by
 //!   `SessionScope` to prevent cross-session pane movement.
-//! - When fewer than 2 panes are resolved (early exit), excess panes in the
-//!   agent-doc window that aren't in the wanted set are stashed before returning.
-//!   This prevents leftover panes from previous layouts from staying visible.
+//! - No early exits — the full reconcile path always runs regardless of how
+//!   many panes resolve (0, 1, or 2+). The DETACH phase stashes excess panes
+//!   from previous layouts; early exits in previous versions bypassed this,
+//!   leaving orphaned panes visible.
 //! - Reconciliation follows an attach-first order: ATTACH missing panes →
 //!   SELECT focus → DETACH unwanted → REORDER if needed → VERIFY.
 //!   This order prevents tmux from auto-selecting an unintended pane when
@@ -74,7 +75,7 @@
 //! - `dead_pane_skip`: registered pane ID is dead → pane skipped with warning, remaining panes reconciled normally
 //! - `in_memory_donor`: unresolved file has a column-mate with a live pane → ephemeral assignment used, registry unchanged
 //! - `spare_pane_assign`: unresolved file has no column-mate but target window has unassigned pane → spare pane assigned ephemerally
-//! - `single_file_no_window`: one file, no `--window` → pane focused, no layout rearrangement
+//! - `single_resolved_stashes_excess`: only 1 file resolves → full reconciler runs, stashes excess panes from previous layouts
 //! - `non_managed_focus`: `--focus` points to unmanaged file → tmux selection preserved as-is
 //! - `registry_update_nonfatal`: registry write fails after pane move → sync completes, warning logged, `SyncLog::has_errors()` false (registry is advisory)
 
@@ -615,37 +616,10 @@ pub fn sync(
         eprintln!("[sync]   resolved: pane={} file={}", r.pane_id, r.path.display());
     }
 
-    // Single file without --window: just focus.
-    if all_files.len() == 1 && window.is_none() {
-        eprintln!("[sync] single-file early exit (no --window)");
-        if let Some(r) = resolved.first() {
-            tmux.select_pane(&r.pane_id)?;
-        }
-        return Ok(early_result(tmux, &file_to_pane));
-    }
-
-    if resolved.len() < 2 {
-        eprintln!("[sync] early exit: resolved < 2, preserving other panes");
-        // Not enough resolved panes for 2D layout — just focus, don't rearrange.
-        // Do NOT stash other panes here: with only 1 resolved pane, remaining panes
-        // belong to agent docs from other columns that should be preserved (the user
-        // expects the previous column's agent doc pane to stay visible).
-        // Excess pane cleanup happens in the full reconcile path (resolved >= 2).
-        //
-        // Respect --focus: only select a pane if the focus file has a resolved pane.
-        // Otherwise, preserve the current tmux selection.
-        if let Some(focus_file) = focus {
-            let focus_path = PathBuf::from(focus_file);
-            if !non_managed_files.contains(&focus_path)
-                && let Some(pane) = file_to_pane.get(&focus_path) {
-                    tmux.select_pane(pane)?;
-                }
-            // else: non-managed or no pane -> preserve selection
-        } else if let Some(r) = resolved.first() {
-            tmux.select_pane(&r.pane_id)?;
-        }
-        return Ok(early_result(tmux, &file_to_pane));
-    }
+    // No early exits — always run the full reconcile path.
+    // Previous versions had early exits for single-file or resolved < 2 cases,
+    // but those bypassed the DETACH phase, leaving orphaned panes from previous
+    // layouts visible. The reconciler handles 0/1/2+ panes uniformly.
 
     // --- Phase 3: Build the 2D column structure with resolved panes ---
     let mut pane_columns: Vec<Vec<String>> = Vec::new();
@@ -669,14 +643,18 @@ pub fn sync(
     pane_columns.retain(|col| !col.is_empty());
 
     if pane_columns.is_empty() {
-        anyhow::bail!("no resolved panes to arrange");
-    }
-    if pane_columns.len() == 1 && pane_columns[0].len() == 1 {
-        eprintln!("[sync] single-pane-column early exit: {}", pane_columns[0][0]);
-        tmux.select_pane(&pane_columns[0][0])?;
+        // No resolved panes — nothing to arrange. Use --window to stash excess.
+        if let Some(w) = window
+            && let Ok(all_panes) = tmux.list_panes_ordered(w)
+            && let Some(first) = all_panes.first()
+            && let Ok(s) = tmux.pane_session(first) {
+                for pane in all_panes.iter().rev() {
+                    let _ = tmux.stash_pane(pane, &s);
+                }
+            }
         return Ok(early_result(tmux, &file_to_pane));
     }
-    eprintln!("[sync] full reconcile path: {} columns, {:?}", pane_columns.len(), pane_columns);
+    eprintln!("[sync] reconcile path: {} columns, {:?}", pane_columns.len(), pane_columns);
 
     // Collect the full set of wanted pane IDs
     let wanted: HashSet<&str> = pane_columns
@@ -759,6 +737,15 @@ pub fn sync(
     };
 
     // --- Phase 5: Reconcile (attach-first: attach -> select -> detach) ---
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/agent-doc-sync.log") {
+            let _ = writeln!(f, "  reconcile: target_window={} pane_columns={:?} desired={:?} session={:?}",
+                target_window, pane_columns, desired_ordered_refs, target_session);
+            let pre = tmux.list_window_panes(&target_window).unwrap_or_default();
+            let _ = writeln!(f, "  pre-reconcile panes: {:?}", pre);
+        }
+    }
     let log = reconcile(
         tmux,
         &target_window,
@@ -768,6 +755,16 @@ pub fn sync(
         focus_pane.as_deref(),
         registry_path,
     )?;
+    {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/agent-doc-sync.log") {
+            let post = tmux.list_window_panes(&target_window).unwrap_or_default();
+            let _ = writeln!(f, "  post-reconcile panes: {:?} errors={}", post, log.has_errors());
+            for entry in &log.entries {
+                let _ = writeln!(f, "    {} {}: {}", if entry.ok { "ok" } else { "ERR" }, entry.phase, entry.message);
+            }
+        }
+    }
 
     // --- Phase 6: Resize + re-select ---
     equalize_sizes(tmux, &pane_columns);
@@ -3768,11 +3765,9 @@ mod tests {
     }
 
     #[test]
-    fn test_sync_early_exit_preserves_other_panes() {
-        // When only 1 file resolves (resolved < 2), sync should NOT stash other panes.
-        // Other panes belong to agent docs from previous columns that should stay visible.
-        // The user expects the previous column's agent doc pane to remain alongside
-        // the one resolved pane.
+    fn test_sync_single_resolved_stashes_excess() {
+        // When only 1 file resolves, the full reconciler still runs and stashes
+        // excess panes that aren't in the wanted set. No early exits.
         let t = IsolatedTmux::new("sync-test-early-exit-stash");
         let tmp = tempfile::TempDir::new().unwrap();
 
@@ -3846,22 +3841,19 @@ mod tests {
         )
         .unwrap();
 
-        // After sync: all 3 panes should still be in the window.
-        // The early exit path (resolved.len() < 2) does NOT stash — other panes
-        // belong to previous-column agent docs that should be preserved.
+        // After sync: only the 1 resolved pane should remain.
+        // The reconciler's DETACH phase stashes excess panes.
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(
             final_panes.len(),
-            3,
-            "all 3 panes should remain in window (no stashing on early exit), got {:?}",
+            1,
+            "only resolved pane should remain after reconcile, got {:?}",
             final_panes
         );
         assert!(final_panes.contains(&pane_a), "resolved pane_a should be in window");
-        assert!(final_panes.contains(&pane_b), "pane_b should be preserved");
-        assert!(final_panes.contains(&pane_c), "pane_c should be preserved");
-    }
 
-    // test_sync_early_exit_stash_derives_session_from_pane removed:
-    // Early-exit path no longer stashes panes. Other panes are preserved
-    // to keep previous-column agent doc sessions visible.
+        // Stashed panes should still be alive
+        assert!(t.pane_alive(&pane_b), "pane_b should be alive in stash");
+        assert!(t.pane_alive(&pane_c), "pane_c should be alive in stash");
+    }
 }
