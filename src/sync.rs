@@ -16,6 +16,9 @@
 //!   (3) spare unassigned pane in the target window.
 //! - All pane-moving operations (join, swap, break) are guarded by
 //!   `SessionScope` to prevent cross-session pane movement.
+//! - When fewer than 2 panes are resolved (early exit), excess panes in the
+//!   agent-doc window that aren't in the wanted set are stashed before returning.
+//!   This prevents leftover panes from previous layouts from staying visible.
 //! - Reconciliation follows an attach-first order: ATTACH missing panes →
 //!   SELECT focus → DETACH unwanted → REORDER if needed → VERIFY.
 //!   This order prevents tmux from auto-selecting an unintended pane when
@@ -614,6 +617,23 @@ pub fn sync(
 
     if resolved.len() < 2 {
         // Not enough resolved panes for 2D layout — just focus, don't rearrange.
+        // But first, stash excess panes from the agent-doc window that aren't in the
+        // wanted set. Without this, old panes from previous layouts stay visible.
+        if let Some(r) = resolved.first() {
+            let wanted_panes: HashSet<&str> = resolved.iter().map(|r| r.pane_id.as_str()).collect();
+            if let Ok(win) = tmux.pane_window(&r.pane_id)
+                && let Ok(all_panes) = tmux.list_panes_ordered(&win) {
+                    let session = doc_tmux_session.as_deref();
+                    // Stash from back (rightmost) to avoid disrupting focus pane position
+                    for pane in all_panes.iter().rev() {
+                        if !wanted_panes.contains(pane.as_str())
+                            && let Some(s) = session
+                            && let Err(e) = tmux.stash_pane(pane, s) {
+                                eprintln!("warning: stash excess pane {} failed: {}", pane, e);
+                            }
+                    }
+                }
+        }
         // Respect --focus: only select a pane if the focus file has a resolved pane.
         // Otherwise, preserve the current tmux selection.
         if let Some(focus_file) = focus {
@@ -3745,5 +3765,124 @@ mod tests {
         assert!(final_panes.contains(&pane_a), "focus pane A should remain");
         assert!(t.pane_alive(&pane_b), "B still alive");
         assert!(t.pane_alive(&pane_c), "C still alive");
+    }
+
+    #[test]
+    fn test_sync_early_exit_stashes_excess_panes() {
+        // Regression test for 3-pane layout bug (Fix 2):
+        // Scenario: 2 columns in editor, but only 1 file is managed (right column).
+        // The left column has an unmanaged file. The agent-doc window has 3 panes
+        // from a previous layout. After sync, only the 1 resolved pane should remain
+        // in the window; the other 2 excess panes should be stashed.
+        //
+        // Before the fix, the `resolved.len() < 2` early exit returned without
+        // stashing excess panes, leaving old panes visible.
+        let t = IsolatedTmux::new("sync-test-early-exit-stash");
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create 3 panes in the same window (simulating a previous 3-pane layout)
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "300", "-y", "60"]);
+        let pane_b = t
+            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let pane_c = t
+            .raw_cmd(&["split-window", "-t", &pane_b, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        // Verify setup: 3 panes in the target window
+        let initial_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(initial_panes.len(), 3, "should start with 3 panes in window");
+
+        // Create test files: one managed (right column), one unmanaged (left column)
+        let file_managed = tmp.path().join("managed.md");
+        let file_unmanaged = tmp.path().join("unmanaged.md");
+        std::fs::write(&file_managed, "# Managed").unwrap();
+        std::fs::write(&file_unmanaged, "# Unmanaged").unwrap();
+
+        // Register only managed.md → pane_a
+        let registry_path = tmp.path().join("registry.json");
+        let mut registry = crate::registry::Registry::new();
+        registry.insert(
+            "session-managed".to_string(),
+            crate::registry::RegistryEntry {
+                pane: pane_a.clone(),
+                pid: std::process::id(),
+                cwd: tmp.path().to_string_lossy().to_string(),
+                started: String::new(),
+                file: file_managed.to_string_lossy().to_string(),
+                window: target_window.clone(),
+            },
+        );
+        crate::registry::save_registry(&registry_path, &registry).unwrap();
+
+        // Layout: 2 columns — left has unmanaged, right has managed
+        let col_args = vec![
+            file_unmanaged.to_string_lossy().to_string(),
+            file_managed.to_string_lossy().to_string(),
+        ];
+
+        let resolve_file = |path: &Path| -> Option<FileResolution> {
+            if path == file_managed {
+                Some(FileResolution::Registered {
+                    key: "session-managed".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else if path == file_unmanaged {
+                Some(FileResolution::Unmanaged)
+            } else {
+                None
+            }
+        };
+
+        let result = sync(
+            &col_args,
+            Some(&target_window),
+            None,
+            &t,
+            &registry_path,
+            &resolve_file,
+        )
+        .unwrap();
+
+        // After sync: only 1 resolved pane (managed.md → pane_a).
+        // The early exit path (resolved.len() < 2) should stash the excess panes.
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(
+            final_panes.len(),
+            1,
+            "only 1 pane should remain in agent-doc window after early-exit stash, got {:?}",
+            final_panes
+        );
+        assert!(
+            final_panes.contains(&pane_a),
+            "the resolved pane (pane_a) should remain in the window"
+        );
+        assert!(
+            !final_panes.contains(&pane_b),
+            "excess pane_b should be stashed"
+        );
+        assert!(
+            !final_panes.contains(&pane_c),
+            "excess pane_c should be stashed"
+        );
+
+        // Stashed panes should still be alive (moved to stash window, not killed)
+        assert!(t.pane_alive(&pane_b), "pane_b should still be alive after stash");
+        assert!(t.pane_alive(&pane_c), "pane_c should still be alive after stash");
+
+        // Result should have 1 file-pane mapping (managed.md only)
+        assert_eq!(result.file_panes.len(), 1, "only managed file should have a pane");
+        let managed_pane = result
+            .file_panes
+            .iter()
+            .find(|(p, _)| p == &file_managed)
+            .map(|(_, id)| id.as_str());
+        assert_eq!(managed_pane, Some(pane_a.as_str()));
     }
 }
