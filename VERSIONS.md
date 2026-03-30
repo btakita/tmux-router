@@ -1,10 +1,17 @@
 # Versions
 
-## 0.3.5 (2026-03-29)
+## 0.3.6 (2026-03-29)
 
 - **No early exits**: Removed all early exits from `sync` — the full reconcile path now runs for 0, 1, or 2+ resolved panes uniformly. Previous early exits for `resolved < 2` bypassed the DETACH phase, leaving orphaned panes from previous layouts visible.
-- Sync trace logging at key decision points (resolution summary, exit path, full reconcile entry)
+- Reconcile detail file logging to `/tmp/agent-doc-sync.log`
+- Empty pane_columns bail stashes all panes via `--window`
 - Test: `test_sync_single_resolved_stashes_excess` verifies 1-pane reconcile stashes excess
+
+## 0.3.5 (2026-03-29)
+
+- Sync trace logging at key decision points (resolution summary, exit path, full reconcile entry)
+- Early-exit stash removed: preserves previous-column panes instead of stashing
+- Test updated: `test_sync_early_exit_preserves_other_panes`
 
 ## 0.3.4 (2026-03-29)
 
