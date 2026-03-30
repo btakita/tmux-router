@@ -621,13 +621,15 @@ pub fn sync(
         // wanted set. Without this, old panes from previous layouts stay visible.
         if let Some(r) = resolved.first() {
             let wanted_panes: HashSet<&str> = resolved.iter().map(|r| r.pane_id.as_str()).collect();
+            // Derive session from the resolved pane (doc_tmux_session is always None
+            // because resolve_file never propagates tmux_session from frontmatter).
+            let session = tmux.pane_session(&r.pane_id).ok();
             if let Ok(win) = tmux.pane_window(&r.pane_id)
-                && let Ok(all_panes) = tmux.list_panes_ordered(&win) {
-                    let session = doc_tmux_session.as_deref();
+                && let Ok(all_panes) = tmux.list_panes_ordered(&win)
+                && let Some(ref s) = session {
                     // Stash from back (rightmost) to avoid disrupting focus pane position
                     for pane in all_panes.iter().rev() {
                         if !wanted_panes.contains(pane.as_str())
-                            && let Some(s) = session
                             && let Err(e) = tmux.stash_pane(pane, s) {
                                 eprintln!("warning: stash excess pane {} failed: {}", pane, e);
                             }
@@ -3884,5 +3886,113 @@ mod tests {
             .find(|(p, _)| p == &file_managed)
             .map(|(_, id)| id.as_str());
         assert_eq!(managed_pane, Some(pane_a.as_str()));
+    }
+
+    #[test]
+    fn test_sync_early_exit_stash_derives_session_from_pane() {
+        // Regression test: the early-exit stash block must derive the tmux session
+        // from the resolved pane via `tmux.pane_session()`, NOT from `doc_tmux_session`
+        // (which comes from frontmatter and is always None in practice).
+        //
+        // Before the fix, `doc_tmux_session.as_deref()` was used, which was always None,
+        // so the `if let Some(ref s) = session` guard failed and no stashing occurred.
+        let t = IsolatedTmux::new("sync-test-session-from-pane");
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Create 3 panes in the same window
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "300", "-y", "60"]);
+        let pane_b = t
+            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap()
+            .trim()
+            .to_string();
+        let pane_c = t
+            .raw_cmd(&["split-window", "-t", &pane_b, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let initial_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(initial_panes.len(), 3, "should start with 3 panes in window");
+
+        let file_managed = tmp.path().join("managed.md");
+        let file_unmanaged = tmp.path().join("unmanaged.md");
+        std::fs::write(&file_managed, "# Managed").unwrap();
+        std::fs::write(&file_unmanaged, "# Unmanaged").unwrap();
+
+        let registry_path = tmp.path().join("registry.json");
+        let mut registry = crate::registry::Registry::new();
+        registry.insert(
+            "session-managed".to_string(),
+            crate::registry::RegistryEntry {
+                pane: pane_a.clone(),
+                pid: std::process::id(),
+                cwd: tmp.path().to_string_lossy().to_string(),
+                started: String::new(),
+                file: file_managed.to_string_lossy().to_string(),
+                window: target_window.clone(),
+            },
+        );
+        crate::registry::save_registry(&registry_path, &registry).unwrap();
+
+        let col_args = vec![
+            file_unmanaged.to_string_lossy().to_string(),
+            file_managed.to_string_lossy().to_string(),
+        ];
+
+        // KEY DIFFERENCE: tmux_session is None here, matching real-world behavior
+        // where frontmatter never sets tmux_session.
+        let resolve_file = |path: &Path| -> Option<FileResolution> {
+            if path == file_managed {
+                Some(FileResolution::Registered {
+                    key: "session-managed".to_string(),
+                    tmux_session: None,
+                })
+            } else if path == file_unmanaged {
+                Some(FileResolution::Unmanaged)
+            } else {
+                None
+            }
+        };
+
+        let result = sync(
+            &col_args,
+            Some(&target_window),
+            None,
+            &t,
+            &registry_path,
+            &resolve_file,
+        )
+        .unwrap();
+
+        // Even with tmux_session: None in FileResolution, excess panes must be stashed
+        // because sync derives the session from the pane itself via tmux.pane_session().
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(
+            final_panes.len(),
+            1,
+            "only 1 pane should remain after early-exit stash with tmux_session: None, got {:?}",
+            final_panes
+        );
+        assert!(
+            final_panes.contains(&pane_a),
+            "the resolved pane (pane_a) should remain in the window"
+        );
+        assert!(
+            !final_panes.contains(&pane_b),
+            "excess pane_b should be stashed even when tmux_session is None"
+        );
+        assert!(
+            !final_panes.contains(&pane_c),
+            "excess pane_c should be stashed even when tmux_session is None"
+        );
+
+        // Stashed panes should still be alive
+        assert!(t.pane_alive(&pane_b), "pane_b should still be alive after stash");
+        assert!(t.pane_alive(&pane_c), "pane_c should still be alive after stash");
+
+        assert_eq!(result.file_panes.len(), 1);
     }
 }
