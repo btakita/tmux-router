@@ -674,13 +674,22 @@ pub fn sync_with_options(
     pane_columns.retain(|col| !col.is_empty());
 
     if pane_columns.is_empty() {
-        // No resolved panes — nothing to arrange. Use --window to stash excess.
+        // No resolved panes. Only stash if ALL files were truly unmanaged (no session UUIDs).
+        // If we had managed files that just couldn't resolve (dead panes, pruned registry),
+        // do NOT stash — that would destroy active sessions for a transient resolution failure.
+        if !unresolved_files.is_empty() {
+            eprintln!(
+                "[sync] WARNING: {} managed file(s) failed to resolve — skipping stash to preserve existing layout",
+                unresolved_files.len()
+            );
+            return Ok(early_result(tmux, &file_to_pane));
+        }
+        // All files are truly unmanaged — safe to stash excess panes
         if let Some(w) = window
             && let Ok(all_panes) = tmux.list_panes_ordered(w)
             && let Some(first) = all_panes.first()
             && let Ok(s) = tmux.pane_session(first) {
                 for pane in all_panes.iter().rev() {
-                    // Skip protected (busy) panes
                     if let Some(ref protect) = options.protect_pane {
                         if protect(pane) {
                             eprintln!("[sync] skipped stashing {} — protected (busy pane)", pane);
