@@ -1,5 +1,13 @@
 # Versions
 
+## 0.3.8 (2026-04-01)
+
+- **Stash guard for unresolved managed files**: When all pane columns are empty because managed files failed to resolve (dead panes, pruned registry), skip stashing to preserve existing layout. Only stash when files are truly unmanaged (no session UUIDs).
+
+## 0.3.7 (2026-03-31)
+
+- **SyncOptions.protect_pane**: Add callback for busy pane guard — protected panes are skipped during stash operations.
+
 ## 0.3.6 (2026-03-29)
 
 - **No early exits**: Removed all early exits from `sync` — the full reconcile path now runs for 0, 1, or 2+ resolved panes uniformly. Previous early exits for `resolved < 2` bypassed the DETACH phase, leaving orphaned panes from previous layouts visible.
