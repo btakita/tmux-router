@@ -604,7 +604,7 @@ dependencies = [
 
 [[package]]
 name = "tmux-router"
-version = "0.3.7"
+version = "0.3.8"
 dependencies = [
  "anyhow",
  "clap",
