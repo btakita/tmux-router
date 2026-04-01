@@ -434,6 +434,21 @@ pub struct SyncResult {
     pub file_panes: Vec<(PathBuf, String)>,
 }
 
+/// Options for sync behavior customization.
+pub struct SyncOptions<'a> {
+    /// Callback to check if a pane should be protected from stashing.
+    /// Returns `true` if the pane is busy (e.g., running an active agent session)
+    /// and should NOT be stashed during the DETACH phase.
+    /// When `None`, all unwanted panes are eligible for stashing.
+    pub protect_pane: Option<&'a dyn Fn(&str) -> bool>,
+}
+
+impl<'a> Default for SyncOptions<'a> {
+    fn default() -> Self {
+        Self { protect_pane: None }
+    }
+}
+
 /// Sync editor layout to tmux panes.
 ///
 /// `col_args` are comma-separated file lists (one per column).
@@ -449,6 +464,22 @@ pub fn sync(
     tmux: &Tmux,
     registry_path: &Path,
     resolve_file: &dyn Fn(&Path) -> Option<FileResolution>,
+) -> Result<SyncResult> {
+    sync_with_options(col_args, window, focus, tmux, registry_path, resolve_file, &SyncOptions::default())
+}
+
+/// Sync editor layout to tmux panes, with customizable options.
+///
+/// Same as `sync` but accepts `SyncOptions` for additional behavior control
+/// (e.g., protecting busy panes from being stashed).
+pub fn sync_with_options(
+    col_args: &[String],
+    window: Option<&str>,
+    focus: Option<&str>,
+    tmux: &Tmux,
+    registry_path: &Path,
+    resolve_file: &dyn Fn(&Path) -> Option<FileResolution>,
+    options: &SyncOptions,
 ) -> Result<SyncResult> {
     let layout = Layout::parse(col_args)?;
     let all_files = layout.all_files();
@@ -649,6 +680,13 @@ pub fn sync(
             && let Some(first) = all_panes.first()
             && let Ok(s) = tmux.pane_session(first) {
                 for pane in all_panes.iter().rev() {
+                    // Skip protected (busy) panes
+                    if let Some(ref protect) = options.protect_pane {
+                        if protect(pane) {
+                            eprintln!("[sync] skipped stashing {} — protected (busy pane)", pane);
+                            continue;
+                        }
+                    }
                     let _ = tmux.stash_pane(pane, &s);
                 }
             }
@@ -754,6 +792,7 @@ pub fn sync(
         target_session.as_deref(),
         focus_pane.as_deref(),
         registry_path,
+        options,
     )?;
     {
         use std::io::Write;
@@ -833,6 +872,7 @@ pub fn reconcile(
     session_name: Option<&str>,
     focus_pane: Option<&str>,
     registry_path: &Path,
+    options: &SyncOptions,
 ) -> Result<SyncLog> {
     let mut log = SyncLog::new();
     let scope = SessionScope::new(tmux, session_name);
@@ -976,6 +1016,13 @@ pub fn reconcile(
         if window_count <= 1 {
             log.log("DETACH", format!("skipped {} — last pane in window", pane));
             continue;
+        }
+        // Busy pane check: skip if caller says this pane is protected
+        if let Some(ref protect) = options.protect_pane {
+            if protect(pane) {
+                log.log("DETACH", format!("skipped {} — protected (busy pane)", pane));
+                continue;
+            }
         }
         // Cross-session check: skip if pane is registered to another session
         if let Some(sess) = session_name
@@ -1479,7 +1526,7 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         // Verify all panes are in the target window
         let final_panes = t.list_window_panes(&target_window).unwrap();
@@ -1532,7 +1579,7 @@ mod tests {
         let current_refs: Vec<&str> = current.iter().map(|s| s.as_str()).collect();
         assert_eq!(current_refs, desired, "setup should produce correct order");
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         assert!(
             log.entries().iter().any(|e| e.phase == "FAST_PATH"),
@@ -1583,7 +1630,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(
@@ -1618,7 +1665,7 @@ mod tests {
         let pane_columns = vec![vec![panes[0].clone()], vec![panes[1].clone()]];
         let desired: Vec<&str> = vec![panes[0].as_str(), panes[1].as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 2);
@@ -1650,7 +1697,7 @@ mod tests {
         ];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str(), pane_c.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         // A and C should be in the window; B should have failed
         let final_panes = t.list_window_panes(&target_window).unwrap();
@@ -1685,7 +1732,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         // Both panes should be in the window
         let final_panes = t.list_window_panes(&target_window).unwrap();
@@ -1710,7 +1757,7 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 5, "all 5 panes should be in window");
@@ -1737,7 +1784,7 @@ mod tests {
         ]];
         let desired: Vec<&str> = vec![panes[0].as_str(), panes[1].as_str(), panes[2].as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 3);
@@ -1763,7 +1810,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_c.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_c.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "anchor A should be in target");
@@ -1799,7 +1846,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         // Final layout should be column-major: A (left), B (right)
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
@@ -1826,7 +1873,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone(), pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
@@ -1863,7 +1910,7 @@ mod tests {
         let pane_columns = vec![vec![panes[0].clone()]];
         let desired: Vec<&str> = vec![panes[0].as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         assert_eq!(final_ordered.len(), 1);
@@ -1891,7 +1938,7 @@ mod tests {
             panes[3].as_str(),
         ];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
@@ -1926,7 +1973,7 @@ mod tests {
             pane_d.as_str(),
         ];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
@@ -1947,7 +1994,7 @@ mod tests {
         ];
         let desired: Vec<&str> = vec![panes[0].as_str(), panes[1].as_str(), panes[2].as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
@@ -1972,7 +2019,7 @@ mod tests {
             panes[3].as_str(),
         ];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
@@ -2027,7 +2074,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a));
@@ -2070,7 +2117,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should be in target");
@@ -2113,7 +2160,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 1, "only A should remain");
@@ -2151,7 +2198,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should be in target");
@@ -2185,7 +2232,7 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         for pane in &desired {
@@ -2218,7 +2265,7 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 3, "should have 3 unique panes");
@@ -2254,7 +2301,7 @@ mod tests {
             pane_d.as_str(),
         ];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         // A and C should be arranged; B and D silently skipped
         let final_panes = t.list_window_panes(&target_window).unwrap();
@@ -2284,7 +2331,7 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 8, "all 8 panes should be in window");
@@ -2324,7 +2371,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 2, "should have exactly 2 panes after sync");
@@ -2380,7 +2427,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 2, "should have exactly 2 panes");
@@ -2415,7 +2462,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should be in target");
@@ -2444,7 +2491,7 @@ mod tests {
         ];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str(), pane_c.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 3, "should have exactly 3 panes");
@@ -2478,7 +2525,7 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 2, "should have exactly A and B");
@@ -2517,7 +2564,7 @@ mod tests {
         ];
         let desired: Vec<&str> = vec![pane_b.as_str(), pane_d.as_str(), pane_a.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A in target");
@@ -2557,7 +2604,7 @@ mod tests {
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
         // First reconcile: should consolidate A and B into target_window
-        let log1 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log1 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         let panes1 = t.list_window_panes(&target_window).unwrap();
         assert_eq!(panes1.len(), 2, "first sync: 2 panes in target");
         assert!(panes1.contains(&pane_a), "first sync: A present");
@@ -2575,7 +2622,7 @@ mod tests {
         let win_count_1 = windows_after_1.lines().count();
 
         // Second reconcile with SAME layout — should be a no-op
-        let log2 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log2 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         let panes2 = t.list_window_panes(&target_window).unwrap();
         assert_eq!(panes2.len(), 2, "second sync: still 2 panes");
         assert!(panes2.contains(&pane_a), "second sync: A present");
@@ -2602,7 +2649,7 @@ mod tests {
         assert_active_window(&state2, &target_window, "second sync");
 
         // Third reconcile — still stable
-        let log3 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+        let log3 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert_eq!(
             log3.mutation_count(),
             0,
@@ -2637,7 +2684,7 @@ mod tests {
         // --- Sync 1: layout = [A, C] ---
         let cols1 = vec![vec![pane_a.clone(), pane_c.clone()]];
         let desired1: Vec<&str> = vec![pane_a.as_str(), pane_c.as_str()];
-        let log1 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), None, &dummy_registry_path()).unwrap();
+        let log1 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log1.has_errors(), "sync1 errors: {:?}", log1.entries());
         let panes1 = t.list_window_panes(&target_window).unwrap();
         assert!(panes1.contains(&pane_a), "sync1: A in target");
@@ -2654,7 +2701,7 @@ mod tests {
         // --- Sync 2: layout = [B, C] (user switched left tab) ---
         let cols2 = vec![vec![pane_b.clone(), pane_c.clone()]];
         let desired2: Vec<&str> = vec![pane_b.as_str(), pane_c.as_str()];
-        let log2 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), None, &dummy_registry_path()).unwrap();
+        let log2 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log2.has_errors(), "sync2 errors: {:?}", log2.entries());
         let panes2 = t.list_window_panes(&target_window).unwrap();
         assert!(panes2.contains(&pane_b), "sync2: B in target");
@@ -2676,7 +2723,7 @@ mod tests {
         );
 
         // --- Sync 3: back to [A, C] (user switched back) ---
-        let log3 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), None, &dummy_registry_path()).unwrap();
+        let log3 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log3.has_errors(), "sync3 errors: {:?}", log3.entries());
         let panes3 = t.list_window_panes(&target_window).unwrap();
         assert!(panes3.contains(&pane_a), "sync3: A in target");
@@ -2695,7 +2742,7 @@ mod tests {
         );
 
         // --- Sync 4: [B, C] again ---
-        let log4 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), None, &dummy_registry_path()).unwrap();
+        let log4 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log4.has_errors(), "sync4 errors: {:?}", log4.entries());
 
         // Verify active window after sync 4
@@ -2776,7 +2823,7 @@ mod tests {
         // --- Sync 1: layout = [[A], [C]], focus = A ---
         let cols1 = vec![vec![pane_a.clone()], vec![pane_c.clone()]];
         let desired1: Vec<&str> = vec![pane_a.as_str(), pane_c.as_str()];
-        let log1 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), Some(&pane_a), &dummy_registry_path()).unwrap();
+        let log1 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), Some(&pane_a), &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log1.has_errors(), "sync1 errors: {:?}", log1.entries());
         let sel1 = active_pane(&t, "test");
         assert_eq!(sel1, pane_a, "sync1: A (left) should be selected after reconcile");
@@ -2784,7 +2831,7 @@ mod tests {
         // --- Sync 2: layout = [[B], [C]], focus = B ---
         let cols2 = vec![vec![pane_b.clone()], vec![pane_c.clone()]];
         let desired2: Vec<&str> = vec![pane_b.as_str(), pane_c.as_str()];
-        let log2 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), Some(&pane_b), &dummy_registry_path()).unwrap();
+        let log2 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), Some(&pane_b), &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log2.has_errors(), "sync2 errors: {:?}", log2.entries());
         // After reconcile: focus pane (B) should already be selected (attach->select->detach)
         let sel2 = active_pane(&t, "test");
@@ -2796,7 +2843,7 @@ mod tests {
         assert_eq!(ordered[1], pane_c, "sync2: C should be rightmost pane");
 
         // --- Sync 3: back to [[A], [C]], focus = A ---
-        let log3 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), Some(&pane_a), &dummy_registry_path()).unwrap();
+        let log3 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), Some(&pane_a), &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log3.has_errors(), "sync3 errors: {:?}", log3.entries());
         let sel3 = active_pane(&t, "test");
         assert_eq!(sel3, pane_a, "sync3: A (left) should be selected after reconcile");
@@ -2806,7 +2853,7 @@ mod tests {
         assert_eq!(ordered3[1], pane_c, "sync3: C should be rightmost pane");
 
         // --- Sync 4: [[B], [C]] again ---
-        let log4 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), Some(&pane_b), &dummy_registry_path()).unwrap();
+        let log4 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), Some(&pane_b), &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log4.has_errors(), "sync4 errors: {:?}", log4.entries());
         let sel4 = active_pane(&t, "test");
         assert_eq!(sel4, pane_b, "sync4: B (left) should be selected after reconcile");
@@ -2839,7 +2886,7 @@ mod tests {
 
         // Helper: full sync flow (reconcile with focus + equalize_sizes + select_pane)
         let full_sync = |cols: &[Vec<String>], desired: &[&str], focus: &str, label: &str| {
-            let log = reconcile(&t, &target_window, cols, desired, Some("test"), Some(focus), &dummy_registry_path()).unwrap();
+            let log = reconcile(&t, &target_window, cols, desired, Some("test"), Some(focus), &dummy_registry_path(), &SyncOptions::default()).unwrap();
             assert!(!log.has_errors(), "{}: reconcile errors: {:?}", label, log.entries());
 
             let sel_after_reconcile = active_pane(&t, "test");
@@ -3080,7 +3127,7 @@ mod tests {
                     .flat_map(|col| col.iter().map(|s| s.as_str()))
                     .collect();
 
-                let _log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+                let _log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
                 // After reconcile, all desired panes must be in the target window
                 let final_panes = t.list_window_panes(&target_window).unwrap();
@@ -3117,10 +3164,10 @@ mod tests {
                     .collect();
 
                 // First reconcile
-                let _log1 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+                let _log1 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
                 // Second reconcile — should be fast path (zero mutations)
-                let log2 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+                let log2 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
                 prop_assert!(
                     log2.entries().iter().any(|e| e.phase == "FAST_PATH"),
@@ -3144,7 +3191,7 @@ mod tests {
                     .collect();
                 let target_window = t.pane_window(&panes[0]).unwrap();
 
-                let _log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path()).unwrap();
+                let _log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
                 // All panes must still be alive (no pane was destroyed)
                 for pane in &panes {
@@ -3182,7 +3229,7 @@ mod tests {
             vec![pane_d.clone()],
         ];
         let desired_all: Vec<&str> = vec![&pane_a, &pane_b, &pane_c, &pane_d];
-        let log1 = reconcile(&t, &target_window, &cols_all, &desired_all, Some("test"), None, &dummy_registry_path()).unwrap();
+        let log1 = reconcile(&t, &target_window, &cols_all, &desired_all, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         assert!(!log1.has_errors(), "sync1 errors: {:?}", log1.entries());
 
         // Pre-fill the stash window with extra panes to make it cramped.
@@ -3198,7 +3245,7 @@ mod tests {
         // the fix should fall back to break_pane.
         let cols_ab = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired_ab: Vec<&str> = vec![&pane_a, &pane_b];
-        let log2 = reconcile(&t, &target_window, &cols_ab, &desired_ab, Some("test"), None, &dummy_registry_path()).unwrap();
+        let log2 = reconcile(&t, &target_window, &cols_ab, &desired_ab, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 2, "should have exactly A and B, got: {:?}", final_panes);
@@ -3240,7 +3287,7 @@ mod tests {
         // Use session_name = Some("test") to trigger stash path
         let log = reconcile(
             &t, &target_window, &pane_columns, &desired,
-            Some("test"), None, &dummy_registry_path(),
+            Some("test"), None, &dummy_registry_path(), &SyncOptions::default(),
         ).unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
@@ -3499,7 +3546,7 @@ mod tests {
         // Pass session_name="main" so the session validation kicks in
         let log = reconcile(
             &t, &target_window, &pane_columns, &desired,
-            Some("main"), None, &dummy_registry_path(),
+            Some("main"), None, &dummy_registry_path(), &SyncOptions::default(),
         ).unwrap();
 
         // The SWAP fast path should have been SKIPPED (cross-session)
@@ -3552,7 +3599,7 @@ mod tests {
 
         let log = reconcile(
             &t, &target_window, &pane_columns, &desired,
-            Some("test"), None, &dummy_registry_path(),
+            Some("test"), None, &dummy_registry_path(), &SyncOptions::default(),
         ).unwrap();
 
         // SWAP fast path should be used (same session)
@@ -3592,7 +3639,7 @@ mod tests {
         // session_name = None — no constraint
         let log = reconcile(
             &t, &target_window, &pane_columns, &desired,
-            None, None, &dummy_registry_path(),
+            None, None, &dummy_registry_path(), &SyncOptions::default(),
         ).unwrap();
 
         let has_swap = log.entries().iter().any(|e| e.phase == "SWAP" && e.ok);
@@ -3620,7 +3667,7 @@ mod tests {
 
         let log = reconcile(
             &t, &target_window, &pane_columns, &desired,
-            Some("main"), None, &dummy_registry_path(),
+            Some("main"), None, &dummy_registry_path(), &SyncOptions::default(),
         ).unwrap();
 
         // Verify cross-session join was blocked
@@ -3659,7 +3706,7 @@ mod tests {
         // Sync both panes into one window
         let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![&pane_a, &pane_b];
-        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path()).unwrap();
+        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         equalize_sizes(&t, &cols);
 
         // Both should be in the window
@@ -3693,7 +3740,7 @@ mod tests {
 
         let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![&pane_a, &pane_b];
-        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path()).unwrap();
+        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
 
         // Shrink
         let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-y", "8"]);
@@ -3721,7 +3768,7 @@ mod tests {
 
         let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![&pane_a, &pane_b];
-        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path()).unwrap();
+        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         equalize_sizes(&t, &cols);
 
         let mut cols_mut = cols.clone();
@@ -3748,7 +3795,7 @@ mod tests {
         // Single column with 3 panes stacked
         let cols = vec![vec![pane_a.clone(), pane_b.clone(), pane_c.clone()]];
         let desired: Vec<&str> = vec![&pane_a, &pane_b, &pane_c];
-        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path()).unwrap();
+        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
         equalize_sizes(&t, &cols);
 
         // Shrink to 15 rows — only 1 pane can fit at MIN_PANE_HEIGHT=10
