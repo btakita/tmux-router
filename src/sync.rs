@@ -242,6 +242,8 @@ impl<'a> SessionScope<'a> {
 
     /// Join a pane into a target, with session boundary check.
     /// Returns Ok(true) if joined, Ok(false) if blocked, Err on tmux failure.
+    /// Cross-session joins are allowed (tmux join-pane supports them natively)
+    /// with a log warning, since registered panes may drift between sessions.
     pub fn join_pane(
         &self,
         src: &str,
@@ -252,15 +254,17 @@ impl<'a> SessionScope<'a> {
         if !self.contains(src) {
             let actual = self.tmux.pane_session(src).unwrap_or_default();
             log.log(
-                "SCOPE_BLOCK",
+                "SCOPE_CROSS",
                 format!(
-                    "join blocked: pane {} in session '{}', scope is '{}'",
+                    "cross-session join: pane {} from session '{}' → scope '{}'",
                     src,
                     actual,
                     self.session.unwrap_or("*")
                 ),
             );
-            return Ok(false);
+            // Allow the join — tmux join-pane handles cross-session moves natively.
+            // Registered panes drift between sessions during stash/rescue cycles;
+            // blocking them leaves orphaned panes that never return.
         }
         self.tmux.join_pane(src, dst, flag)?;
         Ok(true)
@@ -268,6 +272,7 @@ impl<'a> SessionScope<'a> {
 
     /// Swap two panes, with session boundary check on both.
     /// Returns Ok(true) if swapped, Ok(false) if blocked, Err on tmux failure.
+    /// Cross-session swaps are allowed (tmux swap-pane supports them) with a warning.
     pub fn swap_pane(
         &self,
         a: &str,
@@ -278,9 +283,9 @@ impl<'a> SessionScope<'a> {
             let a_sess = self.tmux.pane_session(a).unwrap_or_default();
             let b_sess = self.tmux.pane_session(b).unwrap_or_default();
             log.log(
-                "SCOPE_BLOCK",
+                "SCOPE_CROSS",
                 format!(
-                    "swap blocked: {} in '{}', {} in '{}', scope is '{}'",
+                    "cross-session swap: {} in '{}', {} in '{}', scope is '{}'",
                     a,
                     a_sess,
                     b,
@@ -288,7 +293,8 @@ impl<'a> SessionScope<'a> {
                     self.session.unwrap_or("*")
                 ),
             );
-            return Ok(false);
+            // Allow the swap — registered panes may be in different sessions
+            // after stash/rescue cycles. Blocking prevents pane recovery.
         }
         self.tmux.swap_pane(a, b)?;
         Ok(true)
@@ -685,11 +691,18 @@ pub fn sync_with_options(
             return Ok(early_result(tmux, &file_to_pane));
         }
         // All files are truly unmanaged — safe to stash excess panes
+        // Keep at least one pane to prevent tmux from closing the window.
         if let Some(w) = window
             && let Ok(all_panes) = tmux.list_panes_ordered(w)
             && let Some(first) = all_panes.first()
             && let Ok(s) = tmux.pane_session(first) {
                 for pane in all_panes.iter().rev() {
+                    // Never stash the last pane — tmux closes the window
+                    let remaining = tmux.list_window_panes(w).unwrap_or_default().len();
+                    if remaining <= 1 {
+                        eprintln!("[sync] skipped stashing {} — last pane in window", pane);
+                        break;
+                    }
                     if let Some(ref protect) = options.protect_pane {
                         if protect(pane) {
                             eprintln!("[sync] skipped stashing {} — protected (busy pane)", pane);
@@ -722,11 +735,14 @@ pub fn sync_with_options(
                 "warning: configured tmux_session '{}' is dead, falling back",
                 ts
             );
-            wanted_session.clone().or_else(|| window.and_then(|w| tmux.pane_session(w).ok()))
+            // --window is authoritative: use its session over wanted panes' session.
+            // Wanted panes may have drifted to other sessions during stash/rescue;
+            // --window is the user's intent for where panes should live.
+            window.and_then(|w| tmux.pane_session(w).ok()).or(wanted_session.clone())
         }
     } else {
-        // Prefer wanted panes' session, fall back to --window only if no wanted panes exist
-        wanted_session.clone().or_else(|| window.and_then(|w| tmux.pane_session(w).ok()))
+        // --window is authoritative: use its session over wanted panes' session.
+        window.and_then(|w| tmux.pane_session(w).ok()).or(wanted_session.clone())
     };
     eprintln!("target_session={:?} (wanted_session={:?})", target_session, wanted_session);
 
@@ -3526,8 +3542,8 @@ mod tests {
 
     #[test]
     fn test_swap_pane_validates_same_session() {
-        // When incoming pane is in a different session, the SWAP fast path
-        // should be skipped and join+stash fallback used instead.
+        // Cross-session swaps/joins are now ALLOWED (with SCOPE_CROSS warning).
+        // Registered panes drift between sessions during stash/rescue cycles.
         let t = IsolatedTmux::new("sync-test-cross-session-swap");
         let tmp = TempDir::new().unwrap();
 
@@ -3548,41 +3564,28 @@ mod tests {
         let b_session = t.pane_session(&pane_b).unwrap();
         assert_eq!(b_session, "other", "pane_b should be in 'other' session");
 
-        // Desired: [A, B] replacing X — this is a 1:1 swap scenario
+        // Desired: [A, B] replacing X — cross-session move should succeed
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        // Pass session_name="main" so the session validation kicks in
+        // Pass session_name="main" so the session validation logs a warning
         let log = reconcile(
             &t, &target_window, &pane_columns, &desired,
             Some("main"), None, &dummy_registry_path(), &SyncOptions::default(),
         ).unwrap();
 
-        // The SWAP fast path should have been SKIPPED (cross-session)
-        let has_swap_skip = log.entries().iter().any(|e| e.phase == "SCOPE_BLOCK");
-        let has_swap = log.entries().iter().any(|e| e.phase == "SWAP" && e.ok);
+        // Cross-session operations should be ALLOWED with SCOPE_CROSS warning
+        let has_scope_cross = log.entries().iter().any(|e| e.phase == "SCOPE_CROSS");
         assert!(
-            has_swap_skip,
-            "should log SCOPE_BLOCK for cross-session swap attempt, got: {:?}",
-            log.entries()
-        );
-        assert!(
-            !has_swap,
-            "SWAP should NOT succeed when panes are in different sessions"
-        );
-
-        // The join fallback should ALSO be blocked (cross-session)
-        let has_attach_skip = log.entries().iter().any(|e| e.phase == "SCOPE_BLOCK");
-        assert!(
-            has_attach_skip,
-            "should log SCOPE_BLOCK for cross-session join attempt, got: {:?}",
+            has_scope_cross,
+            "should log SCOPE_CROSS for cross-session operation, got: {:?}",
             log.entries()
         );
 
-        // B should NOT be in the target window (cross-session join prevented)
+        // B should now be in the target window (cross-session join allowed)
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should remain in target");
-        assert!(!final_panes.contains(&pane_b), "B should NOT be joined from different session");
+        assert!(final_panes.contains(&pane_b), "B should be joined from different session");
     }
 
     #[test]
@@ -3656,10 +3659,10 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_session_join_blocked_entirely() {
-        // When a pane is in session "other" and session_name="main",
-        // BOTH swap and join paths should be blocked.
-        let t = IsolatedTmux::new("sync-test-cross-session-join-blocked");
+    fn test_cross_session_join_allowed() {
+        // Cross-session joins are now ALLOWED. Registered panes drift between
+        // sessions during stash/rescue cycles; blocking them leaves orphaned panes.
+        let t = IsolatedTmux::new("sync-test-cross-session-join-allowed");
         let tmp = TempDir::new().unwrap();
 
         // Session "main" with pane A
@@ -3670,7 +3673,7 @@ mod tests {
         // Session "other" with pane B
         let pane_b = t.new_session("other", tmp.path()).unwrap();
 
-        // Desired: [A, B] — B is in wrong session, should be completely blocked
+        // Desired: [A, B] — B is in different session, should be joined with warning
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
@@ -3679,22 +3682,18 @@ mod tests {
             Some("main"), None, &dummy_registry_path(), &SyncOptions::default(),
         ).unwrap();
 
-        // Verify cross-session join was blocked
-        let has_attach_skip = log.entries().iter().any(|e| e.phase == "SCOPE_BLOCK");
+        // Verify cross-session join was allowed with SCOPE_CROSS warning
+        let has_scope_cross = log.entries().iter().any(|e| e.phase == "SCOPE_CROSS");
         assert!(
-            has_attach_skip,
-            "should log SCOPE_BLOCK for cross-session join, got: {:?}",
+            has_scope_cross,
+            "should log SCOPE_CROSS for cross-session join, got: {:?}",
             log.entries()
         );
 
-        // B must NOT be in target window
+        // B should now be in target window (cross-session join succeeded)
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should remain");
-        assert!(!final_panes.contains(&pane_b), "B must not cross session boundary");
-
-        // B should still be in "other" session (not moved)
-        let b_session = t.pane_session(&pane_b).unwrap();
-        assert_eq!(b_session, "other", "B should remain in 'other' session");
+        assert!(final_panes.contains(&pane_b), "B should be joined from different session");
     }
 
     // ── Overflow stash tests ──

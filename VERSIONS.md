@@ -1,5 +1,11 @@
 # Versions
 
+## 0.3.9 (2026-04-04)
+
+- **Cross-session pane operations**: `SessionScope::join_pane` and `SessionScope::swap_pane` now allow cross-session moves (with log warning) instead of blocking them. Registered panes drift between sessions during stash/rescue cycles; blocking left orphaned panes that could never return.
+- **Last-pane guard**: Never stash the last pane in a window. Previously the stash loop could remove all panes, causing tmux to close the window entirely.
+- **`--window` is authoritative for target session**: When `--window` is provided, its session takes priority over wanted panes' session. Wanted panes may have drifted to other sessions during stash/rescue; `--window` represents the user's intent.
+
 ## 0.3.8 (2026-04-01)
 
 - **Stash guard for unresolved managed files**: When all pane columns are empty because managed files failed to resolve (dead panes, pruned registry), skip stashing to preserve existing layout. Only stash when files are truly unmanaged (no session UUIDs).
