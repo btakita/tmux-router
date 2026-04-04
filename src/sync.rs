@@ -696,11 +696,12 @@ pub fn sync_with_options(
             && let Ok(all_panes) = tmux.list_panes_ordered(w)
             && let Some(first) = all_panes.first()
             && let Ok(s) = tmux.pane_session(first) {
+                eprintln!("[sync] stashing unmanaged panes: window={}, panes={:?}, session={}", w, all_panes, s);
                 for pane in all_panes.iter().rev() {
                     // Never stash the last pane — tmux closes the window
                     let remaining = tmux.list_window_panes(w).unwrap_or_default().len();
                     if remaining <= 1 {
-                        eprintln!("[sync] skipped stashing {} — last pane in window", pane);
+                        eprintln!("[sync] skipped stashing {} — last pane in window (remaining={})", pane, remaining);
                         break;
                     }
                     if let Some(ref protect) = options.protect_pane {
