@@ -3,7 +3,9 @@
 pub mod tmux;
 pub mod registry;
 pub mod sync;
+pub mod pane_policy;
 
 pub use tmux::{Tmux, IsolatedTmux, TmuxBatch};
 pub use registry::{RegistryEntry, Registry, RegistryLock, prune, with_registry, with_registry_val};
 pub use sync::{FileResolution, SyncOptions, SyncResult, sync, sync_with_options};
+pub use pane_policy::PaneMoveOp;
