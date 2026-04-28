@@ -278,18 +278,9 @@ impl Tmux {
         batch.execute()
             .with_context(|| format!("failed to select pane {}", pane_id))?;
 
-        // Log the session for debugging. We do NOT switch-client
-        // because that would force ALL terminal clients to jump sessions.
-        if let Ok(output) = self
-            .cmd()
-            .args(["display-message", "-t", pane_id, "-p", "#{session_name}:#{window_index}"])
-            .output()
-        {
-            let info = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            eprintln!("[tmux] select_pane {} → session:window {}", pane_id, info);
-        }
         Ok(())
     }
+
 
     /// Split an existing pane, creating a new pane in the same window.
     ///
@@ -1175,4 +1166,5 @@ mod batch_tests {
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 2);
     }
+
 }
