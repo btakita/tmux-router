@@ -17,6 +17,8 @@
 //!   returns the pane ID; uses `session:` target syntax to avoid numeric-name ambiguity.
 //! - `send_keys(pane_id, text)` — sends text literally (`-l`) then `Enter` as a
 //!   separate call with a 100 ms delay between them for TUI compatibility.
+//! - `send_key(pane_id, key)` — sends a single tmux key name (for example `Enter`,
+//!   `Up`, `Escape`) without enabling literal mode.
 //! - `send_keys_raw(pane_id, keys)` — sends keystrokes without literal mode or Enter,
 //!   allowing tmux key names (`C-c`, `Escape`, etc.) to be interpreted.
 //! - `select_pane(pane_id)` — focuses a pane by batching `select-window` +
@@ -30,6 +32,8 @@
 //!   pane in the sole window of its session to prevent accidental session destruction.
 //! - `session_window_count(session)` — counts windows in a session.
 //! - `pane_window(pane_id)` / `pane_session(target)` — resolve containment hierarchy.
+//! - `ensure_pane_in_session(pane_id, expected_session)` — fail closed when a pane
+//!   drifted into a different tmux session than the caller expects.
 //! - `list_window_panes(window_id)` — lists all pane IDs in a window.
 //! - `list_panes_ordered(window_id)` — same but sorted by left/top screen position.
 //! - `largest_pane_in_window(window_id)` — returns the pane ID with the most rows.
@@ -67,7 +71,7 @@
 //! - `select_pane` never disrupts other connected terminal clients (`switch-client`
 //!   is intentionally omitted).
 //! - `send_keys` always interprets its `text` argument literally (no tmux key expansion).
-//!   Use `send_keys_raw` when key names like `C-c` are required.
+//!   Use `send_key` / `send_keys_raw` when key names like `C-c` or `Enter` are required.
 //! - Isolated test servers (`IsolatedTmux`) are guaranteed to be torn down on drop
 //!   even if the test panics, preventing socket leaks.
 //! - `TmuxBatch::execute` is fire-and-forget at the individual command level —
@@ -265,6 +269,19 @@ impl Tmux {
         Ok(())
     }
 
+    /// Send a single tmux key name to a pane without literal mode.
+    pub fn send_key(&self, pane_id: &str, key: &str) -> Result<()> {
+        let status = self
+            .cmd()
+            .args(["send-keys", "-t", pane_id, key])
+            .status()
+            .context("failed to run tmux send-keys (single key)")?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys failed for pane {}", pane_id);
+        }
+        Ok(())
+    }
+
     /// Select (focus) a tmux pane.
     ///
     /// Uses TmuxBatch to combine select-window + select-pane in a single
@@ -458,6 +475,20 @@ impl Tmux {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Require that a pane belongs to the expected tmux session.
+    pub fn ensure_pane_in_session(&self, pane_id: &str, expected_session: &str) -> Result<()> {
+        let pane_session = self.pane_session(pane_id)?;
+        if pane_session != expected_session {
+            anyhow::bail!(
+                "pane {} is in session '{}', expected '{}' — refusing cross-session move",
+                pane_id,
+                pane_session,
+                expected_session
+            );
+        }
+        Ok(())
     }
 
     /// List all pane IDs in a given window.
@@ -1167,4 +1198,46 @@ mod batch_tests {
         assert_eq!(batch.len(), 2);
     }
 
+}
+
+#[cfg(test)]
+mod tmux_tests {
+    use super::*;
+    use std::path::Path;
+    use std::time::Duration;
+
+    #[test]
+    fn ensure_pane_in_session_accepts_matching_session() {
+        let iso = IsolatedTmux::new("tmux-ensure-session-ok");
+        let pane = iso.new_session("sess-a", Path::new("/tmp")).unwrap();
+        iso.ensure_pane_in_session(&pane, "sess-a").unwrap();
+    }
+
+    #[test]
+    fn ensure_pane_in_session_rejects_mismatched_session() {
+        let iso = IsolatedTmux::new("tmux-ensure-session-mismatch");
+        let pane = iso.new_session("sess-b", Path::new("/tmp")).unwrap();
+        let err = iso
+            .ensure_pane_in_session(&pane, "sess-a")
+            .expect_err("mismatched session should fail");
+        assert!(
+            err.to_string().contains("expected 'sess-a'"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn send_key_submits_buffered_input() {
+        let iso = IsolatedTmux::new("tmux-send-key");
+        let pane = iso.new_session("sess-a", Path::new("/tmp")).unwrap();
+        iso.send_keys(&pane, "cat").unwrap();
+        iso.send_keys_raw(&pane, "hello").unwrap();
+        iso.send_key(&pane, "Enter").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        let content = iso.capture_pane(&pane, Some(20)).unwrap();
+        assert!(
+            content.contains("hello"),
+            "pane should contain submitted input after send_key Enter: {content}"
+        );
+    }
 }

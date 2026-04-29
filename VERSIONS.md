@@ -1,5 +1,9 @@
 # Versions
 
+## Unreleased
+
+- **Session/key primitives extracted from agent-doc.** `Tmux` now owns `send_key()` and `ensure_pane_in_session()`, so sibling projects can reuse single-key dispatch and fail-closed session checks without shelling out for their own wrappers.
+
 ## 0.3.9 (2026-04-04)
 
 - **Cross-session pane operations**: `SessionScope::join_pane` and `SessionScope::swap_pane` now allow cross-session moves (with log warning) instead of blocking them. Registered panes drift between sessions during stash/rescue cycles; blocking left orphaned panes that could never return.
