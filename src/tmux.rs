@@ -53,8 +53,8 @@
 //! - `auto_start(session, cwd)` — creates a session if the server or session is absent,
 //!   otherwise creates a new window; returns the new pane ID.
 //! - `capture_pane(pane_id, lines)` — captures visible content or N scrollback lines.
-//! - `enable_remain_on_exit(pane_id)` — enables `remain-on-exit on` for the pane's
-//!   current window so dead panes remain inspectable until cleanup.
+//! - `enable_remain_on_exit(pane_id)` — enables pane-local `remain-on-exit on` so
+//!   dead panes remain inspectable even after stash/rescue window moves.
 //! - `pane_dead_status(pane_id)` — returns tmux's retained dead-pane exit status when
 //!   a pane is dead and still present.
 //! - `raw_cmd(args)` — escape hatch for arbitrary tmux commands; returns trimmed stdout.
@@ -180,21 +180,19 @@ impl Tmux {
             .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
             .output();
         match output {
-            Ok(out) if out.status.success() => {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .filter_map(|line| {
-                        let mut parts = line.splitn(2, '\t');
-                        let pane_id = parts.next()?.trim();
-                        let pane_dead = parts.next().unwrap_or("0").trim();
-                        if pane_id.is_empty() || pane_dead == "1" {
-                            None
-                        } else {
-                            Some(pane_id.to_string())
-                        }
-                    })
-                    .collect()
-            }
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let mut parts = line.splitn(2, '\t');
+                    let pane_id = parts.next()?.trim();
+                    let pane_dead = parts.next().unwrap_or("0").trim();
+                    if pane_id.is_empty() || pane_dead == "1" {
+                        None
+                    } else {
+                        Some(pane_id.to_string())
+                    }
+                })
+                .collect(),
             _ => std::collections::HashSet::new(),
         }
     }
@@ -327,12 +325,12 @@ impl Tmux {
         let mut batch = TmuxBatch::new(self);
         batch.add(&["select-window", "-t", pane_id]);
         batch.add(&["select-pane", "-t", pane_id]);
-        batch.execute()
+        batch
+            .execute()
             .with_context(|| format!("failed to select pane {}", pane_id))?;
 
         Ok(())
     }
-
 
     /// Split an existing pane, creating a new pane in the same window.
     ///
@@ -428,7 +426,8 @@ impl Tmux {
                         anyhow::bail!(
                             "refusing to kill pane {} — it is the last pane in the last window of session '{}'; \
                              killing would destroy the entire session",
-                            pane_id, session_name
+                            pane_id,
+                            session_name
                         );
                     }
                 }
@@ -472,13 +471,7 @@ impl Tmux {
     pub fn pane_window(&self, pane_id: &str) -> Result<String> {
         let output = self
             .cmd()
-            .args([
-                "display-message",
-                "-t",
-                pane_id,
-                "-p",
-                "#{window_id}",
-            ])
+            .args(["display-message", "-t", pane_id, "-p", "#{window_id}"])
             .output()
             .context("failed to run tmux display-message")?;
         if !output.status.success() {
@@ -494,13 +487,7 @@ impl Tmux {
     pub fn pane_session(&self, target: &str) -> Result<String> {
         let output = self
             .cmd()
-            .args([
-                "display-message",
-                "-t",
-                target,
-                "-p",
-                "#{session_name}",
-            ])
+            .args(["display-message", "-t", target, "-p", "#{session_name}"])
             .output()
             .context("failed to query tmux session name")?;
         if !output.status.success() {
@@ -530,13 +517,7 @@ impl Tmux {
     pub fn list_window_panes(&self, window_id: &str) -> Result<Vec<String>> {
         let output = self
             .cmd()
-            .args([
-                "list-panes",
-                "-t",
-                window_id,
-                "-F",
-                "#{pane_id}",
-            ])
+            .args(["list-panes", "-t", window_id, "-F", "#{pane_id}"])
             .output()
             .context("failed to run tmux list-panes")?;
         if !output.status.success() {
@@ -589,13 +570,7 @@ impl Tmux {
     pub fn resize_pane(&self, pane_id: &str, flag: &str, size: u32) -> Result<()> {
         let status = self
             .cmd()
-            .args([
-                "resize-pane",
-                "-t",
-                pane_id,
-                flag,
-                &format!("{}%", size),
-            ])
+            .args(["resize-pane", "-t", pane_id, flag, &format!("{}%", size)])
             .status()
             .context("failed to run tmux resize-pane")?;
         if !status.success() {
@@ -615,7 +590,8 @@ impl Tmux {
             anyhow::bail!("tmux display-message failed for window {}", window_id);
         }
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        s.parse::<usize>().with_context(|| format!("invalid window height: {:?}", s))
+        s.parse::<usize>()
+            .with_context(|| format!("invalid window height: {:?}", s))
     }
 
     /// Query the height (rows) of a tmux pane.
@@ -629,7 +605,8 @@ impl Tmux {
             anyhow::bail!("tmux display-message failed for pane {}", pane_id);
         }
         let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        s.parse::<usize>().with_context(|| format!("invalid pane height: {:?}", s))
+        s.parse::<usize>()
+            .with_context(|| format!("invalid pane height: {:?}", s))
     }
 
     /// Apply a named layout to a window (e.g., "even-horizontal", "tiled").
@@ -775,7 +752,10 @@ impl Tmux {
         let stash_window = match self.ensure_stash_window(session_name) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("warning: stash window failed ({}), falling back to break_pane", e);
+                eprintln!(
+                    "warning: stash window failed ({}), falling back to break_pane",
+                    e
+                );
                 return self.break_pane(pane_id);
             }
         };
@@ -784,12 +764,11 @@ impl Tmux {
             // Resize stash window tall enough to accept another pane.
             // Use a very large size to prevent "pane too small" errors.
             // The stash window is never displayed, so size doesn't matter visually.
-            let _ = self.raw_cmd(&[
-                "resize-window", "-t", &stash_window, "-y", "1000",
-            ]);
+            let _ = self.raw_cmd(&["resize-window", "-t", &stash_window, "-y", "1000"]);
             // Target the LARGEST pane in the stash to avoid "pane too small" errors.
             // tmux join-pane splits the target pane — if it's only 1 row, the join fails.
-            let target = self.largest_pane_in_window(&stash_window)
+            let target = self
+                .largest_pane_in_window(&stash_window)
                 .unwrap_or_else(|| stash_panes[0].clone());
             // Use -dv: -d prevents changing the active pane, -v stacks vertically.
             // On failure: kill the pane instead of creating an orphan stash window.
@@ -797,7 +776,10 @@ impl Tmux {
             match self.join_pane(pane_id, &target, "-dv") {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    eprintln!("[stash] join-pane {} → {} failed ({}), breaking to overflow stash", pane_id, target, e);
+                    eprintln!(
+                        "[stash] join-pane {} → {} failed ({}), breaking to overflow stash",
+                        pane_id, target, e
+                    );
                     self.break_pane_to_stash(pane_id, session_name)
                 }
             }
@@ -845,10 +827,11 @@ impl Tmux {
         self.break_pane(pane_id)?;
         // Find the window that now contains this pane and rename it to "stash"
         if let Ok(window_id) = self.pane_window(pane_id) {
-            let _ = self.raw_cmd(&[
-                "rename-window", "-t", &window_id, "stash",
-            ]);
-            eprintln!("[stash] created overflow stash window {} for pane {}", window_id, pane_id);
+            let _ = self.raw_cmd(&["rename-window", "-t", &window_id, "stash"]);
+            eprintln!(
+                "[stash] created overflow stash window {} for pane {}",
+                window_id, pane_id
+            );
         }
         Ok(())
     }
@@ -973,11 +956,9 @@ impl Tmux {
         for line in String::from_utf8_lossy(&sess_out.stdout).lines() {
             let parts: Vec<&str> = line.splitn(3, '\t').collect();
             if parts.len() >= 3 {
-                sessions
-                    .entry(parts[0].to_string())
-                    .or_insert_with(|| {
-                        (parts[1].to_string(), parts[2].to_string(), BTreeMap::new())
-                    });
+                sessions.entry(parts[0].to_string()).or_insert_with(|| {
+                    (parts[1].to_string(), parts[2].to_string(), BTreeMap::new())
+                });
             }
         }
 
@@ -985,13 +966,14 @@ impl Tmux {
         for line in String::from_utf8_lossy(&panes_out.stdout).lines() {
             let parts: Vec<&str> = line.splitn(5, '\t').collect();
             if parts.len() >= 5
-                && let Some((_, _, windows)) = sessions.get_mut(parts[0]) {
-                    windows
-                        .entry(parts[1].to_string())
-                        .or_insert_with(|| (parts[2].to_string(), Vec::new()))
-                        .1
-                        .push((parts[3].to_string(), parts[4].to_string()));
-                }
+                && let Some((_, _, windows)) = sessions.get_mut(parts[0])
+            {
+                windows
+                    .entry(parts[1].to_string())
+                    .or_insert_with(|| (parts[2].to_string(), Vec::new()))
+                    .1
+                    .push((parts[3].to_string(), parts[4].to_string()));
+            }
         }
 
         // Format tree
@@ -1039,7 +1021,10 @@ impl Tmux {
             start_line = format!("-{}", n);
             args.extend(["-S", &start_line]);
         }
-        let output = self.cmd().args(&args).output()
+        let output = self
+            .cmd()
+            .args(&args)
+            .output()
             .context("failed to run tmux capture-pane")?;
         if !output.status.success() {
             anyhow::bail!(
@@ -1050,16 +1035,15 @@ impl Tmux {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    /// Enable dead-pane retention on the pane's current window.
+    /// Enable dead-pane retention on the pane itself so the setting survives moves.
     pub fn enable_remain_on_exit(&self, pane_id: &str) -> Result<()> {
-        let window_id = self.pane_window(pane_id)?;
         let status = self
             .cmd()
-            .args(["set-option", "-t", &window_id, "remain-on-exit", "on"])
+            .args(["set-option", "-p", "-t", pane_id, "remain-on-exit", "on"])
             .status()
             .context("failed to run tmux set-option remain-on-exit")?;
         if !status.success() {
-            anyhow::bail!("tmux set-option remain-on-exit failed for {}", window_id);
+            anyhow::bail!("tmux set-option remain-on-exit failed for {}", pane_id);
         }
         Ok(())
     }
@@ -1071,7 +1055,13 @@ impl Tmux {
         }
         let output = self
             .cmd()
-            .args(["display-message", "-t", pane_id, "-p", "#{pane_dead_status}"])
+            .args([
+                "display-message",
+                "-t",
+                pane_id,
+                "-p",
+                "#{pane_dead_status}",
+            ])
             .output()
             .context("failed to run tmux display-message for pane_dead_status")?;
         if !output.status.success() {
@@ -1180,7 +1170,8 @@ impl<'a> TmuxBatch<'a> {
 
     /// Add a tmux command (as argument slices) to the batch.
     pub fn add(&mut self, args: &[&str]) -> &mut Self {
-        self.commands.push(args.iter().map(|s| s.to_string()).collect());
+        self.commands
+            .push(args.iter().map(|s| s.to_string()).collect());
         self
     }
 
@@ -1213,9 +1204,7 @@ impl<'a> TmuxBatch<'a> {
             cmd.args(args);
         }
 
-        let status = cmd
-            .status()
-            .context("failed to execute tmux batch")?;
+        let status = cmd.status().context("failed to execute tmux batch")?;
 
         if !status.success() {
             anyhow::bail!("tmux batch failed (exit code {:?})", status.code());
@@ -1237,9 +1226,7 @@ impl<'a> TmuxBatch<'a> {
             cmd.args(args);
         }
 
-        let output = cmd
-            .output()
-            .context("failed to execute tmux batch")?;
+        let output = cmd.output().context("failed to execute tmux batch")?;
 
         if !output.status.success() {
             anyhow::bail!("tmux batch failed (exit code {:?})", output.status.code());
@@ -1271,7 +1258,6 @@ mod batch_tests {
         assert!(!batch.is_empty());
         assert_eq!(batch.len(), 2);
     }
-
 }
 
 #[cfg(test)]
@@ -1345,5 +1331,32 @@ mod tmux_tests {
             "retained dead pane should not be treated as alive"
         );
         assert_eq!(iso.pane_dead_status(&pane).unwrap().as_deref(), Some("7"));
+    }
+
+    #[test]
+    fn pane_level_remain_on_exit_survives_stash_move() {
+        let iso = IsolatedTmux::new("tmux-pane-dead-stash-retained");
+        let cwd = Path::new("/tmp");
+        let pane1 = iso.new_session("sess-stash", cwd).unwrap();
+        let pane2 = iso.split_window(&pane1, cwd, "-dh").unwrap();
+        iso.enable_remain_on_exit(&pane2).unwrap();
+
+        let original_window = iso.pane_window(&pane2).unwrap();
+        iso.stash_pane(&pane2, "sess-stash").unwrap();
+        assert!(
+            wait_for(Duration::from_secs(3), || {
+                iso.pane_window(&pane2)
+                    .map(|window| window != original_window)
+                    .unwrap_or(false)
+            }),
+            "pane should move into stash before exit"
+        );
+
+        iso.send_keys(&pane2, "exit 17").unwrap();
+        assert!(
+            wait_for(Duration::from_secs(3), || iso.pane_dead(&pane2)),
+            "pane should still be retained as dead after exiting from stash"
+        );
+        assert_eq!(iso.pane_dead_status(&pane2).unwrap().as_deref(), Some("17"));
     }
 }
