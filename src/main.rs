@@ -117,8 +117,10 @@ fn main() -> Result<()> {
                     pid: 0,
                     cwd: String::new(),
                     started: chrono_now(),
+                    session_id: String::new(),
                     file: file.clone(),
                     window: tmux.pane_window(&pane).unwrap_or_default(),
+                    supervisor_instance_id: String::new(),
                 },
             );
             registry::save_registry(&cli.registry, &reg)?;

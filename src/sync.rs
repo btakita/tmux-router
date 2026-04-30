@@ -4312,8 +4312,10 @@ mod tests {
                 pid: std::process::id(),
                 cwd: tmp.path().to_string_lossy().to_string(),
                 started: String::new(),
+                session_id: "session-aaa".to_string(),
                 file: file_a.to_string_lossy().to_string(),
                 window: target_window.clone(),
+                supervisor_instance_id: String::new(),
             },
         );
         crate::registry::save_registry(&registry_path, &registry).unwrap();
@@ -4430,8 +4432,10 @@ mod tests {
                 pid: std::process::id(),
                 cwd: tmp.path().to_string_lossy().to_string(),
                 started: String::new(),
+                session_id: "session-aaa".to_string(),
                 file: file_a.to_string_lossy().to_string(),
                 window: target_window.clone(),
+                supervisor_instance_id: String::new(),
             },
         );
         registry.insert(
@@ -4441,8 +4445,10 @@ mod tests {
                 pid: std::process::id(),
                 cwd: tmp.path().to_string_lossy().to_string(),
                 started: String::new(),
+                session_id: "session-bbb".to_string(),
                 file: file_b.to_string_lossy().to_string(),
                 window: target_window.clone(),
+                supervisor_instance_id: String::new(),
             },
         );
         crate::registry::save_registry(&registry_path, &registry).unwrap();
@@ -5040,8 +5046,10 @@ mod tests {
                 pid: std::process::id(),
                 cwd: tmp.path().to_string_lossy().to_string(),
                 started: String::new(),
+                session_id: "session-managed".to_string(),
                 file: file_managed.to_string_lossy().to_string(),
                 window: target_window.clone(),
+                supervisor_instance_id: String::new(),
             },
         );
         crate::registry::save_registry(&registry_path, &registry).unwrap();

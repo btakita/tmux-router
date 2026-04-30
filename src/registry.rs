@@ -120,15 +120,22 @@ where
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegistryEntry {
     pub pane: String,
+    /// Owning agent-doc supervisor PID. Legacy entries may contain other process IDs.
     pub pid: u32,
     pub cwd: String,
     pub started: String,
+    /// Document session UUID. Legacy registries used this as the map key.
+    #[serde(default)]
+    pub session_id: String,
     /// Relative path to the associated file (empty for legacy entries).
     #[serde(default)]
     pub file: String,
     /// Tmux window ID (e.g. `@5`) at claim time. Empty for legacy entries.
     #[serde(default)]
     pub window: String,
+    /// Stable identity for the long-lived supervisor instance in the pane.
+    #[serde(default)]
+    pub supervisor_instance_id: String,
 }
 
 pub type Registry = HashMap<String, RegistryEntry>;
@@ -316,8 +323,10 @@ mod tests {
                     pid: 1234,
                     cwd: "/tmp".to_string(),
                     started: "2026-01-01T00:00:00Z".to_string(),
+                    session_id: "session-1".to_string(),
                     file: "test.md".to_string(),
                     window: "@1".to_string(),
+                    supervisor_instance_id: String::new(),
                 },
             );
             Ok(())
@@ -342,8 +351,10 @@ mod tests {
                     pid: 1,
                     cwd: "/".to_string(),
                     started: "".to_string(),
+                    session_id: "session-a".to_string(),
                     file: "".to_string(),
                     window: "".to_string(),
+                    supervisor_instance_id: String::new(),
                 },
             );
             Ok(reg.len())
@@ -376,8 +387,10 @@ mod tests {
                             pid: i as u32,
                             cwd: "/".to_string(),
                             started: "".to_string(),
+                            session_id: format!("session-{}", i),
                             file: "".to_string(),
                             window: "".to_string(),
+                            supervisor_instance_id: String::new(),
                         },
                     );
                     Ok(())
