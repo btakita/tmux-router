@@ -182,7 +182,10 @@ impl SyncLog {
                 self.log("GLOBAL", format!("[{}] windows: {}", label, windows));
             }
             Err(e) => {
-                self.log_err("GLOBAL", format!("[{}] failed to list windows: {}", label, e));
+                self.log_err(
+                    "GLOBAL",
+                    format!("[{}] failed to list windows: {}", label, e),
+                );
             }
         }
         // Log all panes
@@ -244,13 +247,7 @@ impl<'a> SessionScope<'a> {
     /// Returns Ok(true) if joined, Ok(false) if blocked, Err on tmux failure.
     /// Cross-session joins are allowed (tmux join-pane supports them natively)
     /// with a log warning, since registered panes may drift between sessions.
-    pub fn join_pane(
-        &self,
-        src: &str,
-        dst: &str,
-        flag: &str,
-        log: &mut SyncLog,
-    ) -> Result<bool> {
+    pub fn join_pane(&self, src: &str, dst: &str, flag: &str, log: &mut SyncLog) -> Result<bool> {
         if !self.contains(src) {
             let actual = self.tmux.pane_session(src).unwrap_or_default();
             log.log(
@@ -273,12 +270,7 @@ impl<'a> SessionScope<'a> {
     /// Swap two panes, with session boundary check on both.
     /// Returns Ok(true) if swapped, Ok(false) if blocked, Err on tmux failure.
     /// Cross-session swaps are allowed (tmux swap-pane supports them) with a warning.
-    pub fn swap_pane(
-        &self,
-        a: &str,
-        b: &str,
-        log: &mut SyncLog,
-    ) -> Result<bool> {
+    pub fn swap_pane(&self, a: &str, b: &str, log: &mut SyncLog) -> Result<bool> {
         if !self.contains(a) || !self.contains(b) {
             let a_sess = self.tmux.pane_session(a).unwrap_or_default();
             let b_sess = self.tmux.pane_session(b).unwrap_or_default();
@@ -406,9 +398,10 @@ pub fn find_best_window(
         // Only consider windows in the same tmux session
         if let Some(ts) = target_session
             && let Ok(pane_sess) = tmux.pane_session(pane_id)
-                && pane_sess != ts {
-                    continue;
-                }
+            && pane_sess != ts
+        {
+            continue;
+        }
         let window_panes = tmux.list_window_panes(&win).unwrap_or_default();
         let wanted_count = window_panes
             .iter()
@@ -421,7 +414,10 @@ pub fn find_best_window(
             best_window = win;
         }
     }
-    eprintln!("target_window={} (auto-detected, {} wanted panes)", best_window, best_wanted);
+    eprintln!(
+        "target_window={} (auto-detected, {} wanted panes)",
+        best_window, best_wanted
+    );
     best_window
 }
 
@@ -471,7 +467,15 @@ pub fn sync(
     registry_path: &Path,
     resolve_file: &dyn Fn(&Path) -> Option<FileResolution>,
 ) -> Result<SyncResult> {
-    sync_with_options(col_args, window, focus, tmux, registry_path, resolve_file, &SyncOptions::default())
+    sync_with_options(
+        col_args,
+        window,
+        focus,
+        tmux,
+        registry_path,
+        resolve_file,
+        &SyncOptions::default(),
+    )
 }
 
 /// Sync editor layout to tmux panes, with customizable options.
@@ -594,7 +598,9 @@ pub fn sync_with_options(
     {
         // Determine target window: --window arg, or window of first resolved pane
         let target_win = window.map(|w| w.to_string()).or_else(|| {
-            resolved.first().and_then(|r| tmux.pane_window(&r.pane_id).ok())
+            resolved
+                .first()
+                .and_then(|r| tmux.pane_window(&r.pane_id).ok())
         });
 
         if let Some(ref win_id) = target_win {
@@ -634,23 +640,35 @@ pub fn sync_with_options(
     }
 
     // Helper: build an early SyncResult from the first resolved pane.
-    let early_result = |tmux: &Tmux, file_to_pane: &std::collections::HashMap<PathBuf, String>| -> SyncResult {
-        let win = resolved.first()
-            .and_then(|r| tmux.pane_window(&r.pane_id).ok())
-            .unwrap_or_default();
-        SyncResult {
-            target_session: doc_tmux_session.clone(),
-            target_window: win,
-            file_panes: file_to_pane.iter().map(|(p, id)| (p.clone(), id.clone())).collect(),
-        }
-    };
+    let early_result =
+        |tmux: &Tmux, file_to_pane: &std::collections::HashMap<PathBuf, String>| -> SyncResult {
+            let win = resolved
+                .first()
+                .and_then(|r| tmux.pane_window(&r.pane_id).ok())
+                .unwrap_or_default();
+            SyncResult {
+                target_session: doc_tmux_session.clone(),
+                target_window: win,
+                file_panes: file_to_pane
+                    .iter()
+                    .map(|(p, id)| (p.clone(), id.clone()))
+                    .collect(),
+            }
+        };
 
     eprintln!(
         "[sync] resolution: resolved={} unresolved={} non_managed={} all_files={}",
-        resolved.len(), unresolved_files.len(), non_managed_files.len(), all_files.len()
+        resolved.len(),
+        unresolved_files.len(),
+        non_managed_files.len(),
+        all_files.len()
     );
     for r in &resolved {
-        eprintln!("[sync]   resolved: pane={} file={}", r.pane_id, r.path.display());
+        eprintln!(
+            "[sync]   resolved: pane={} file={}",
+            r.pane_id,
+            r.path.display()
+        );
     }
 
     // No early exits — always run the full reconcile path.
@@ -695,27 +713,38 @@ pub fn sync_with_options(
         if let Some(w) = window
             && let Ok(all_panes) = tmux.list_panes_ordered(w)
             && let Some(first) = all_panes.first()
-            && let Ok(s) = tmux.pane_session(first) {
-                eprintln!("[sync] stashing unmanaged panes: window={}, panes={:?}, session={}", w, all_panes, s);
-                for pane in all_panes.iter().rev() {
-                    // Never stash the last pane — tmux closes the window
-                    let remaining = tmux.list_window_panes(w).unwrap_or_default().len();
-                    if remaining <= 1 {
-                        eprintln!("[sync] skipped stashing {} — last pane in window (remaining={})", pane, remaining);
-                        break;
-                    }
-                    if let Some(ref protect) = options.protect_pane {
-                        if protect(pane) {
-                            eprintln!("[sync] skipped stashing {} — protected (busy pane)", pane);
-                            continue;
-                        }
-                    }
-                    let _ = tmux.stash_pane(pane, &s);
+            && let Ok(s) = tmux.pane_session(first)
+        {
+            eprintln!(
+                "[sync] stashing unmanaged panes: window={}, panes={:?}, session={}",
+                w, all_panes, s
+            );
+            for pane in all_panes.iter().rev() {
+                // Never stash the last pane — tmux closes the window
+                let remaining = tmux.list_window_panes(w).unwrap_or_default().len();
+                if remaining <= 1 {
+                    eprintln!(
+                        "[sync] skipped stashing {} — last pane in window (remaining={})",
+                        pane, remaining
+                    );
+                    break;
                 }
+                if let Some(ref protect) = options.protect_pane {
+                    if protect(pane) {
+                        eprintln!("[sync] skipped stashing {} — protected (busy pane)", pane);
+                        continue;
+                    }
+                }
+                let _ = tmux.stash_pane(pane, &s);
             }
+        }
         return Ok(early_result(tmux, &file_to_pane));
     }
-    eprintln!("[sync] reconcile path: {} columns, {:?}", pane_columns.len(), pane_columns);
+    eprintln!(
+        "[sync] reconcile path: {} columns, {:?}",
+        pane_columns.len(),
+        pane_columns
+    );
 
     // Collect the full set of wanted pane IDs
     let wanted: HashSet<&str> = pane_columns
@@ -739,13 +768,20 @@ pub fn sync_with_options(
             // --window is authoritative: use its session over wanted panes' session.
             // Wanted panes may have drifted to other sessions during stash/rescue;
             // --window is the user's intent for where panes should live.
-            window.and_then(|w| tmux.pane_session(w).ok()).or(wanted_session.clone())
+            window
+                .and_then(|w| tmux.pane_session(w).ok())
+                .or(wanted_session.clone())
         }
     } else {
         // --window is authoritative: use its session over wanted panes' session.
-        window.and_then(|w| tmux.pane_session(w).ok()).or(wanted_session.clone())
+        window
+            .and_then(|w| tmux.pane_session(w).ok())
+            .or(wanted_session.clone())
     };
-    eprintln!("target_session={:?} (wanted_session={:?})", target_session, wanted_session);
+    eprintln!(
+        "target_session={:?} (wanted_session={:?})",
+        target_session, wanted_session
+    );
 
     // Validate --window against target_session. If --window is in a different session,
     // ignore it to prevent cross-session pane movement.
@@ -758,7 +794,10 @@ pub fn sync_with_options(
             match tmux.pane_session(w) {
                 Ok(ws) if ws == *ts => Some(w),
                 Ok(ws) => {
-                    eprintln!("warning: --window {} is in session '{}', but target is '{}' — ignoring", w, ws, ts);
+                    eprintln!(
+                        "warning: --window {} is in session '{}', but target is '{}' — ignoring",
+                        w, ws, ts
+                    );
                     None
                 }
                 Err(_) => None,
@@ -803,9 +842,16 @@ pub fn sync_with_options(
     // --- Phase 5: Reconcile (attach-first: attach -> select -> detach) ---
     {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/agent-doc-sync.log") {
-            let _ = writeln!(f, "  reconcile: target_window={} pane_columns={:?} desired={:?} session={:?}",
-                target_window, pane_columns, desired_ordered_refs, target_session);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/agent-doc-sync.log")
+        {
+            let _ = writeln!(
+                f,
+                "  reconcile: target_window={} pane_columns={:?} desired={:?} session={:?}",
+                target_window, pane_columns, desired_ordered_refs, target_session
+            );
             let pre = tmux.list_window_panes(&target_window).unwrap_or_default();
             let _ = writeln!(f, "  pre-reconcile panes: {:?}", pre);
         }
@@ -822,11 +868,26 @@ pub fn sync_with_options(
     )?;
     {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/agent-doc-sync.log") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/tmp/agent-doc-sync.log")
+        {
             let post = tmux.list_window_panes(&target_window).unwrap_or_default();
-            let _ = writeln!(f, "  post-reconcile panes: {:?} errors={}", post, log.has_errors());
+            let _ = writeln!(
+                f,
+                "  post-reconcile panes: {:?} errors={}",
+                post,
+                log.has_errors()
+            );
             for entry in &log.entries {
-                let _ = writeln!(f, "    {} {}: {}", if entry.ok { "ok" } else { "ERR" }, entry.phase, entry.message);
+                let _ = writeln!(
+                    f,
+                    "    {} {}: {}",
+                    if entry.ok { "ok" } else { "ERR" },
+                    entry.phase,
+                    entry.message
+                );
             }
         }
     }
@@ -838,12 +899,24 @@ pub fn sync_with_options(
     // After equalize, check if any pane is below MIN_PANE_HEIGHT.
     // If so, stash overflow panes (last column first) until all remaining fit.
     if let Some(ref session) = target_session {
-        stash_overflow_panes(tmux, &mut pane_columns, session, &target_window, focus_pane.as_deref());
+        stash_overflow_panes(
+            tmux,
+            &mut pane_columns,
+            session,
+            &target_window,
+            focus_pane.as_deref(),
+        );
     }
 
     if let Some(ref fp) = focus_pane
-        && tmux.pane_alive(fp) { tmux.select_pane(fp)?; }
-    let sel = target_session.as_deref().and_then(|s| tmux.active_pane(s)).unwrap_or_default();
+        && tmux.pane_alive(fp)
+    {
+        tmux.select_pane(fp)?;
+    }
+    let sel = target_session
+        .as_deref()
+        .and_then(|s| tmux.active_pane(s))
+        .unwrap_or_default();
     eprintln!("phase6: focus={:?}, selected={}", focus_pane, sel);
 
     // Log global tmux state at sync end
@@ -909,7 +982,9 @@ pub fn reconcile(
     // --- SNAPSHOT ---
     let current = tmux.list_panes_ordered(target_window).unwrap_or_default();
     let current_refs: Vec<&str> = current.iter().map(|s| s.as_str()).collect();
-    let sel = session_name.and_then(|s| tmux.active_pane(s)).unwrap_or_default();
+    let sel = session_name
+        .and_then(|s| tmux.active_pane(s))
+        .unwrap_or_default();
     log.log(
         "SNAPSHOT",
         format!(
@@ -930,11 +1005,13 @@ pub fn reconcile(
     // --- SWAP fast path: 1:1 pane replacement ---
     // When exactly one pane needs to come in and one needs to go out,
     // use swap-pane for an atomic visual transition (no flicker).
-    let to_attach: Vec<&str> = desired_ordered.iter()
+    let to_attach: Vec<&str> = desired_ordered
+        .iter()
         .copied()
         .filter(|p| !current_set.contains(*p))
         .collect();
-    let to_detach: Vec<&str> = current_panes.iter()
+    let to_detach: Vec<&str> = current_panes
+        .iter()
         .map(|s| s.as_str())
         .filter(|p| !wanted.contains(p))
         .collect();
@@ -961,7 +1038,13 @@ pub fn reconcile(
                     // Scope blocked the swap — fall through to ATTACH/DETACH
                 }
                 Err(e) => {
-                    log.log_err("SWAP", format!("swap-pane failed ({} ↔ {}): {}, falling back to join+stash", incoming, outgoing, e));
+                    log.log_err(
+                        "SWAP",
+                        format!(
+                            "swap-pane failed ({} ↔ {}): {}, falling back to join+stash",
+                            incoming, outgoing, e
+                        ),
+                    );
                     // Fall through to normal ATTACH/DETACH
                 }
             }
@@ -976,12 +1059,21 @@ pub fn reconcile(
             let flag = first_pane_join_flag(pane_columns, target);
             match scope.join_pane(first_pane, target, flag, &mut log) {
                 Ok(true) => {
-                    log.log("ATTACH", format!("joined first {} into {} ({})", first_pane, target_window, flag));
+                    log.log(
+                        "ATTACH",
+                        format!(
+                            "joined first {} into {} ({})",
+                            first_pane, target_window, flag
+                        ),
+                    );
                     update_registry(tmux, first_pane, registry_path, &mut log);
                 }
                 Ok(false) => {} // scope blocked — logged by scope
                 Err(e) => {
-                    log.log_err("ATTACH", format!("failed to join first {}: {}", first_pane, e));
+                    log.log_err(
+                        "ATTACH",
+                        format!("failed to join first {}: {}", first_pane, e),
+                    );
                 }
             }
         }
@@ -1012,19 +1104,27 @@ pub fn reconcile(
                 }
                 Ok(false) => {} // scope blocked
                 Err(e) => {
-                    log.log_err("ATTACH", format!("failed to join {} → {}: {}", pane, target_pane, e));
+                    log.log_err(
+                        "ATTACH",
+                        format!("failed to join {} → {}: {}", pane, target_pane, e),
+                    );
                 }
             }
         }
     }
 
-    let sel = session_name.and_then(|s| tmux.active_pane(s)).unwrap_or_default();
+    let sel = session_name
+        .and_then(|s| tmux.active_pane(s))
+        .unwrap_or_default();
     log.log("ATTACH", format!("done — selected={}", sel));
 
     // --- SELECT focus pane (before detach, so stash won't change selection) ---
     let select_target = focus_pane.unwrap_or(first_pane);
     let _ = tmux.select_pane(select_target);
-    log.log("SELECT", format!("pre-selected {} before detach", select_target));
+    log.log(
+        "SELECT",
+        format!("pre-selected {} before detach", select_target),
+    );
 
     // --- DETACH unwanted panes ---
     let refreshed = tmux.list_window_panes(target_window).unwrap_or_default();
@@ -1032,13 +1132,19 @@ pub fn reconcile(
     let active_before_detach = session_name
         .and_then(|s| tmux.active_window(s))
         .unwrap_or_default();
-    log.log("DETACH", format!("active_window_before={}", active_before_detach));
+    log.log(
+        "DETACH",
+        format!("active_window_before={}", active_before_detach),
+    );
 
     for pane in &refreshed {
         if wanted.contains(pane.as_str()) {
             continue;
         }
-        let window_count = tmux.list_window_panes(target_window).unwrap_or_default().len();
+        let window_count = tmux
+            .list_window_panes(target_window)
+            .unwrap_or_default()
+            .len();
         if window_count <= 1 {
             log.log("DETACH", format!("skipped {} — last pane in window", pane));
             continue;
@@ -1046,7 +1152,10 @@ pub fn reconcile(
         // Busy pane check: skip if caller says this pane is protected
         if let Some(ref protect) = options.protect_pane {
             if protect(pane) {
-                log.log("DETACH", format!("skipped {} — protected (busy pane)", pane));
+                log.log(
+                    "DETACH",
+                    format!("skipped {} — protected (busy pane)", pane),
+                );
                 continue;
             }
         }
@@ -1057,13 +1166,14 @@ pub fn reconcile(
             let owned_by_other = reg.values().any(|entry| {
                 entry.pane == *pane && !entry.window.is_empty() && {
                     // Check if this pane's registered window belongs to a different session
-                    tmux.pane_session(pane)
-                        .map(|s| s != sess)
-                        .unwrap_or(false)
+                    tmux.pane_session(pane).map(|s| s != sess).unwrap_or(false)
                 }
             });
             if owned_by_other {
-                log.log("DETACH", format!("skipped {} — registered to another session", pane));
+                log.log(
+                    "DETACH",
+                    format!("skipped {} — registered to another session", pane),
+                );
                 continue;
             }
         }
@@ -1074,17 +1184,23 @@ pub fn reconcile(
         };
         match result {
             Ok(()) => {
-                log.log("DETACH", format!("{} {} from {}", verb, pane, target_window));
+                log.log(
+                    "DETACH",
+                    format!("{} {} from {}", verb, pane, target_window),
+                );
                 update_registry(tmux, pane, registry_path, &mut log);
                 // Log active window after each stash to detect focus steal
                 let active_after = session_name
                     .and_then(|s| tmux.active_window(s))
                     .unwrap_or_default();
                 if active_after != active_before_detach {
-                    log.log_err("DETACH", format!(
-                        "FOCUS STEAL: active window changed {} → {} after stashing {}",
-                        active_before_detach, active_after, pane
-                    ));
+                    log.log_err(
+                        "DETACH",
+                        format!(
+                            "FOCUS STEAL: active window changed {} → {} after stashing {}",
+                            active_before_detach, active_after, pane
+                        ),
+                    );
                 }
             }
             Err(e) => {
@@ -1098,13 +1214,18 @@ pub fn reconcile(
         .and_then(|s| tmux.active_window(s))
         .unwrap_or_default();
     if active_after_detach != target_window {
-        log.log("DETACH", format!(
-            "restoring focus: {} → {} (was stolen during stash)",
-            active_after_detach, target_window
-        ));
+        log.log(
+            "DETACH",
+            format!(
+                "restoring focus: {} → {} (was stolen during stash)",
+                active_after_detach, target_window
+            ),
+        );
     }
     let _ = tmux.select_window(target_window);
-    let sel = session_name.and_then(|s| tmux.active_pane(s)).unwrap_or_default();
+    let sel = session_name
+        .and_then(|s| tmux.active_pane(s))
+        .unwrap_or_default();
     log.log("DETACH", format!("done — selected={}", sel));
 
     // --- REORDER if needed ---
@@ -1113,7 +1234,13 @@ pub fn reconcile(
     let final_set: HashSet<&str> = current_order_refs.iter().copied().collect();
 
     if final_set == wanted && current_order_refs != desired_ordered {
-        log.log("REORDER", format!("current={:?}, desired={:?}", current_order_refs, desired_ordered));
+        log.log(
+            "REORDER",
+            format!(
+                "current={:?}, desired={:?}",
+                current_order_refs, desired_ordered
+            ),
+        );
         for pane in desired_ordered.iter().skip(1) {
             let _ = tmux.break_pane(pane);
             log.log("REORDER", format!("broke {} for reorder", pane));
@@ -1132,7 +1259,10 @@ pub fn reconcile(
                 }
                 let (target_pane, flag) = join_target(pane_columns, col_idx, row_idx);
                 let _ = tmux.join_pane(pane, &target_pane, flag);
-                log.log("REORDER", format!("rejoined {} → {} ({})", pane, target_pane, flag));
+                log.log(
+                    "REORDER",
+                    format!("rejoined {} → {} ({})", pane, target_pane, flag),
+                );
             }
         }
         // Re-select focus after reorder
@@ -1199,7 +1329,11 @@ fn first_pane_join_flag(pane_columns: &[Vec<String>], existing_pane: &str) -> &'
 
 /// Determine join target and split direction for a pane at (col_idx, row_idx).
 /// All flags include `-d` to prevent changing the active pane during reconcile.
-fn join_target(pane_columns: &[Vec<String>], col_idx: usize, row_idx: usize) -> (String, &'static str) {
+fn join_target(
+    pane_columns: &[Vec<String>],
+    col_idx: usize,
+    row_idx: usize,
+) -> (String, &'static str) {
     if col_idx == 0 {
         // Same column as anchor: stack below previous pane
         (pane_columns[0][row_idx - 1].clone(), "-dv")
@@ -1238,9 +1372,10 @@ pub fn equalize_sizes(tmux: &Tmux, pane_columns: &[Vec<String>]) {
     if pane_columns.len() == 2 {
         let _ = tmux.resize_pane(&pane_columns[0][0], "-x", 50);
     } else if pane_columns.len() > 2
-        && let Ok(win) = tmux.pane_window(&pane_columns[0][0]) {
-            let _ = tmux.select_layout(&win, "even-horizontal");
-        }
+        && let Ok(win) = tmux.pane_window(&pane_columns[0][0])
+    {
+        let _ = tmux.select_layout(&win, "even-horizontal");
+    }
     for col in pane_columns {
         if col.len() > 1 {
             let pct = 100 / col.len() as u32;
@@ -1284,9 +1419,10 @@ fn stash_overflow_panes(
     };
 
     // Check for undersized panes (covers both vertical and horizontal overflow)
-    let has_undersized = pane_columns.iter().flat_map(|c| c.iter()).any(|pane| {
-        tmux.pane_height(pane).unwrap_or(MIN_PANE_HEIGHT) < MIN_PANE_HEIGHT
-    });
+    let has_undersized = pane_columns
+        .iter()
+        .flat_map(|c| c.iter())
+        .any(|pane| tmux.pane_height(pane).unwrap_or(MIN_PANE_HEIGHT) < MIN_PANE_HEIGHT);
 
     let needs_vertical_stash = pane_columns.iter().any(|col| col.len() > max_panes_per_col);
 
@@ -1324,17 +1460,18 @@ fn stash_overflow_panes(
     // Keep stashing last-column panes until only 1 column remains or panes fit.
     while pane_columns.len() > 1 {
         // Re-check: are any panes still undersized?
-        let still_undersized = pane_columns.iter().flat_map(|c| c.iter()).any(|pane| {
-            tmux.pane_height(pane).unwrap_or(MIN_PANE_HEIGHT) < MIN_PANE_HEIGHT
-        });
+        let still_undersized = pane_columns
+            .iter()
+            .flat_map(|c| c.iter())
+            .any(|pane| tmux.pane_height(pane).unwrap_or(MIN_PANE_HEIGHT) < MIN_PANE_HEIGHT);
         if !still_undersized {
             break;
         }
 
         // Find the last column that has a non-focus pane to stash
-        let col_idx = pane_columns.iter().rposition(|col| {
-            col.iter().any(|p| !focus_set.contains(p.as_str()))
-        });
+        let col_idx = pane_columns
+            .iter()
+            .rposition(|col| col.iter().any(|p| !focus_set.contains(p.as_str())));
         let col_idx = match col_idx {
             Some(i) => i,
             None => break, // Only focus panes remain
@@ -1394,10 +1531,7 @@ mod tests {
 
     #[test]
     fn parse_multiple_cols() {
-        let args = vec![
-            "plan.md,corky.md".to_string(),
-            "agent-doc.md".to_string(),
-        ];
+        let args = vec!["plan.md,corky.md".to_string(), "agent-doc.md".to_string()];
         let layout = Layout::parse(&args).unwrap();
         assert_eq!(layout.columns.len(), 2);
         assert_eq!(layout.columns[0].files.len(), 2);
@@ -1512,7 +1646,12 @@ mod tests {
     /// Assert that all given panes are alive.
     fn assert_all_alive(tmux: &IsolatedTmux, panes: &[String], msg: &str) {
         for pane in panes {
-            assert!(tmux.pane_alive(pane), "{}: pane {} should be alive", msg, pane);
+            assert!(
+                tmux.pane_alive(pane),
+                "{}: pane {} should be alive",
+                msg,
+                pane
+            );
         }
     }
 
@@ -1521,7 +1660,15 @@ mod tests {
         let first_pane = tmux.new_session("test", tmp.path()).unwrap();
         let target_window = tmux.pane_window(&first_pane).unwrap();
         // Resize window large enough to fit many panes
-        let _ = tmux.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = tmux.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let mut panes = vec![first_pane];
         for _ in 1..n {
             let pane = tmux.new_window("test", tmp.path()).unwrap();
@@ -1552,7 +1699,17 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // Verify all panes are in the target window
         let final_panes = t.list_window_panes(&target_window).unwrap();
@@ -1563,14 +1720,21 @@ mod tests {
                 pane
             );
         }
-        assert!(!log.has_errors(), "should have no errors: {:?}", log.entries());
+        assert!(
+            !log.has_errors(),
+            "should have no errors: {:?}",
+            log.entries()
+        );
 
         // Snapshot-based state assertions
         let state = snapshot_state(&t, "test", &target_window);
         assert_target_panes(&state, &desired, "2col happy path");
         assert_active_window(&state, &target_window, "2col happy path");
         // 3 panes started in 3 windows; after joining 2 into target, only 1 window remains
-        assert_eq!(state.window_count, 1, "2col happy path: all panes consolidated into 1 window");
+        assert_eq!(
+            state.window_count, 1,
+            "2col happy path: all panes consolidated into 1 window"
+        );
         assert_all_alive(&t, &panes, "2col happy path");
     }
 
@@ -1605,7 +1769,17 @@ mod tests {
         let current_refs: Vec<&str> = current.iter().map(|s| s.as_str()).collect();
         assert_eq!(current_refs, desired, "setup should produce correct order");
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         assert!(
             log.entries().iter().any(|e| e.phase == "FAST_PATH"),
@@ -1617,7 +1791,10 @@ mod tests {
         let state = snapshot_state(&t, "test", &target_window);
         assert_target_panes(&state, &desired, "already correct");
         assert_active_window(&state, &target_window, "already correct");
-        assert_eq!(state.window_count, 1, "already correct: window count unchanged");
+        assert_eq!(
+            state.window_count, 1,
+            "already correct: window count unchanged"
+        );
         assert_all_alive(&t, &[pane_a, pane_b], "already correct");
     }
 
@@ -1656,13 +1833,20 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
-        assert!(
-            !final_panes.contains(&pane_x),
-            "X should have been evicted"
-        );
+        assert!(!final_panes.contains(&pane_x), "X should have been evicted");
         assert!(final_panes.contains(&pane_a), "A should remain");
         assert!(final_panes.contains(&pane_b), "B should remain");
 
@@ -1679,7 +1863,10 @@ mod tests {
         assert_target_panes(&state, &desired, "unwanted evicted");
         assert_active_window(&state, &target_window, "unwanted evicted");
         // Started with 1 window (all panes via split). X evicted to solo window -> 2 windows.
-        assert_eq!(state.window_count, 2, "unwanted evicted: target + X's solo window");
+        assert_eq!(
+            state.window_count, 2,
+            "unwanted evicted: target + X's solo window"
+        );
     }
 
     #[test]
@@ -1691,7 +1878,17 @@ mod tests {
         let pane_columns = vec![vec![panes[0].clone()], vec![panes[1].clone()]];
         let desired: Vec<&str> = vec![panes[0].as_str(), panes[1].as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 2);
@@ -1717,19 +1914,29 @@ mod tests {
         t.kill_pane(&pane_b).unwrap();
 
         // Desired: [A, B, C] — B is dead
-        let pane_columns = vec![
-            vec![pane_a.clone(), pane_b.clone()],
-            vec![pane_c.clone()],
-        ];
+        let pane_columns = vec![vec![pane_a.clone(), pane_b.clone()], vec![pane_c.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str(), pane_c.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // A and C should be in the window; B should have failed
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a));
         assert!(final_panes.contains(&pane_c));
-        assert!(!final_panes.contains(&pane_b), "dead pane should not be present");
+        assert!(
+            !final_panes.contains(&pane_b),
+            "dead pane should not be present"
+        );
 
         assert!(log.has_errors(), "should have errors for dead pane");
         assert!(
@@ -1758,14 +1965,26 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // Both panes should be in the window
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a));
         assert!(final_panes.contains(&pane_b));
-        assert!(!log.has_errors() || log.entries().iter().any(|e| e.phase == "VERIFY"),
-            "reconcile should complete");
+        assert!(
+            !log.has_errors() || log.entries().iter().any(|e| e.phase == "VERIFY"),
+            "reconcile should complete"
+        );
     }
 
     #[test]
@@ -1783,7 +2002,17 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 5, "all 5 panes should be in window");
@@ -1794,7 +2023,11 @@ mod tests {
                 pane
             );
         }
-        assert!(!log.has_errors(), "should have no errors: {:?}", log.entries());
+        assert!(
+            !log.has_errors(),
+            "should have no errors: {:?}",
+            log.entries()
+        );
     }
 
     #[test]
@@ -1803,14 +2036,20 @@ mod tests {
         let (target_window, panes, _tmp) = setup_panes(&t, 3);
 
         // Single column with 3 panes stacked vertically
-        let pane_columns = vec![vec![
-            panes[0].clone(),
-            panes[1].clone(),
-            panes[2].clone(),
-        ]];
+        let pane_columns = vec![vec![panes[0].clone(), panes[1].clone(), panes[2].clone()]];
         let desired: Vec<&str> = vec![panes[0].as_str(), panes[1].as_str(), panes[2].as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 3);
@@ -1836,17 +2075,27 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_c.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_c.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
-        assert!(final_panes.contains(&pane_a), "anchor A should be in target");
+        assert!(
+            final_panes.contains(&pane_a),
+            "anchor A should be in target"
+        );
         assert!(final_panes.contains(&pane_c), "C should be in target");
 
         // B should have been evicted (it was in target but not wanted)
-        assert!(
-            !final_panes.contains(&pane_b),
-            "B should have been evicted"
-        );
+        assert!(!final_panes.contains(&pane_b), "B should have been evicted");
         assert!(t.pane_alive(&pane_b), "B should still be alive");
 
         assert!(
@@ -1866,22 +2115,47 @@ mod tests {
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let pane_b = t.new_window("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_b).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
 
         // Desired: [[A], [B]] — two columns, A left, B right
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // Final layout should be column-major: A (left), B (right)
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
-        assert_eq!(final_refs, desired, "layout should be column-major without REORDER");
+        assert_eq!(
+            final_refs, desired,
+            "layout should be column-major without REORDER"
+        );
 
         // Should NOT have REORDER entries — the join flag should place A correctly
         let has_reorder = log.entries().iter().any(|e| e.phase == "REORDER");
-        assert!(!has_reorder, "anchor join should use correct flag, avoiding REORDER: {:?}", log.entries());
+        assert!(
+            !has_reorder,
+            "anchor join should use correct flag, avoiding REORDER: {:?}",
+            log.entries()
+        );
     }
 
     /// Verify anchor joins above a desired pane in the same column (single-column layout).
@@ -1893,20 +2167,45 @@ mod tests {
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let pane_b = t.new_window("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_b).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
 
         // Desired: [[A, B]] — single column, A above, B below
         let pane_columns = vec![vec![pane_a.clone(), pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
-        assert_eq!(final_refs, desired, "layout should stack A above B without REORDER");
+        assert_eq!(
+            final_refs, desired,
+            "layout should stack A above B without REORDER"
+        );
 
         let has_reorder = log.entries().iter().any(|e| e.phase == "REORDER");
-        assert!(!has_reorder, "anchor join should use vertical flag, avoiding REORDER: {:?}", log.entries());
+        assert!(
+            !has_reorder,
+            "anchor join should use vertical flag, avoiding REORDER: {:?}",
+            log.entries()
+        );
     }
 
     /// Verify first_pane_join_flag returns correct flags for various pane positions.
@@ -1936,7 +2235,17 @@ mod tests {
         let pane_columns = vec![vec![panes[0].clone()]];
         let desired: Vec<&str> = vec![panes[0].as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         assert_eq!(final_ordered.len(), 1);
@@ -1964,12 +2273,26 @@ mod tests {
             panes[3].as_str(),
         ];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
         assert_eq!(final_refs, desired, "2x2 grid should be column-major order");
-        assert!(!log.has_errors(), "2x2 grid should have no errors: {:?}", log.entries());
+        assert!(
+            !log.has_errors(),
+            "2x2 grid should have no errors: {:?}",
+            log.entries()
+        );
     }
 
     /// 2x2 grid with anchor not in target — anchor must join with correct flag.
@@ -1986,7 +2309,15 @@ mod tests {
 
         // Use C's window as target — A is anchor but not in target
         let target_window = t.pane_window(&pane_c).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
 
         let pane_columns = vec![
             vec![pane_a.clone(), pane_b.clone()],
@@ -1999,11 +2330,24 @@ mod tests {
             pane_d.as_str(),
         ];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
-        assert_eq!(final_refs, desired, "2x2 grid with anchor elsewhere should produce correct column-major order");
+        assert_eq!(
+            final_refs, desired,
+            "2x2 grid with anchor elsewhere should produce correct column-major order"
+        );
         assert!(!log.has_errors());
     }
 
@@ -2020,11 +2364,24 @@ mod tests {
         ];
         let desired: Vec<&str> = vec![panes[0].as_str(), panes[1].as_str(), panes[2].as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
-        assert_eq!(final_refs, desired, "3-column horizontal layout should be left-to-right");
+        assert_eq!(
+            final_refs, desired,
+            "3-column horizontal layout should be left-to-right"
+        );
         assert!(!log.has_errors());
     }
 
@@ -2045,11 +2402,24 @@ mod tests {
             panes[3].as_str(),
         ];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_ordered = t.list_panes_ordered(&target_window).unwrap();
         let final_refs: Vec<&str> = final_ordered.iter().map(|s| s.as_str()).collect();
-        assert_eq!(final_refs, desired, "asymmetric 3+1 layout should be column-major");
+        assert_eq!(
+            final_refs, desired,
+            "asymmetric 3+1 layout should be column-major"
+        );
         assert!(!log.has_errors());
     }
 
@@ -2100,7 +2470,17 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a));
@@ -2122,7 +2502,10 @@ mod tests {
         assert_target_panes(&state, &desired, "mixed evict and join");
         assert_active_window(&state, &target_window, "mixed evict and join");
         // Started: 2 windows (target with A+X, B solo). After: target (A+B), X solo -> 2 windows.
-        assert_eq!(state.window_count, 2, "mixed evict and join: target + X's solo window");
+        assert_eq!(
+            state.window_count, 2,
+            "mixed evict and join: target + X's solo window"
+        );
         assert_all_alive(&t, &[pane_a, pane_b], "mixed evict and join");
     }
 
@@ -2135,7 +2518,15 @@ mod tests {
 
         let pane_x = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_x).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_a = t.new_window("test", tmp.path()).unwrap();
         let pane_b = t.new_window("test", tmp.path()).unwrap();
 
@@ -2143,7 +2534,17 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should be in target");
@@ -2170,15 +2571,35 @@ mod tests {
         // Create A in target, split to add X1 and X2
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_x1 = t
             .raw_cmd(&[
-                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .unwrap();
         let pane_x2 = t
             .raw_cmd(&[
-                "split-window", "-t", &pane_a, "-v", "-P", "-F", "#{pane_id}",
+                "split-window",
+                "-t",
+                &pane_a,
+                "-v",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .unwrap();
 
@@ -2186,7 +2607,17 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 1, "only A should remain");
@@ -2199,7 +2630,11 @@ mod tests {
             .iter()
             .filter(|e| e.phase == "DETACH" && e.ok && e.message.starts_with("broke"))
             .count();
-        assert!(detach_count >= 2, "should have detached at least 2 panes, got {}", detach_count);
+        assert!(
+            detach_count >= 2,
+            "should have detached at least 2 panes, got {}",
+            detach_count
+        );
     }
 
     #[test]
@@ -2210,13 +2645,27 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
 
         // Create B and C in a separate window (split)
         let pane_b = t.new_window("test", tmp.path()).unwrap();
         let pane_c = t
             .raw_cmd(&[
-                "split-window", "-t", &pane_b, "-h", "-P", "-F", "#{pane_id}",
+                "split-window",
+                "-t",
+                &pane_b,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .unwrap();
 
@@ -2224,7 +2673,17 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should be in target");
@@ -2233,7 +2692,11 @@ mod tests {
 
         // C should still be alive in its own window
         assert!(t.pane_alive(&pane_c), "C should still be alive");
-        assert!(!log.has_errors(), "should have no errors: {:?}", log.entries());
+        assert!(
+            !log.has_errors(),
+            "should have no errors: {:?}",
+            log.entries()
+        );
     }
 
     // --- Real-world simulation tests ---
@@ -2258,7 +2721,17 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         for pane in &desired {
@@ -2271,7 +2744,11 @@ mod tests {
         // Dead panes should not appear
         assert!(!final_panes.contains(&panes[3]));
         assert!(!final_panes.contains(&panes[4]));
-        assert!(!log.has_errors(), "no errors for survivors: {:?}", log.entries());
+        assert!(
+            !log.has_errors(),
+            "no errors for survivors: {:?}",
+            log.entries()
+        );
     }
 
     #[test]
@@ -2291,7 +2768,17 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 3, "should have 3 unique panes");
@@ -2306,7 +2793,15 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_b = t.new_window("test", tmp.path()).unwrap();
         let pane_c = t.new_window("test", tmp.path()).unwrap();
         let pane_d = t.new_window("test", tmp.path()).unwrap();
@@ -2327,14 +2822,30 @@ mod tests {
             pane_d.as_str(),
         ];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // A and C should be arranged; B and D silently skipped
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should be in target");
         assert!(final_panes.contains(&pane_c), "C should be in target");
-        assert!(!final_panes.contains(&pane_b), "dead B should not be present");
-        assert!(!final_panes.contains(&pane_d), "dead D should not be present");
+        assert!(
+            !final_panes.contains(&pane_b),
+            "dead B should not be present"
+        );
+        assert!(
+            !final_panes.contains(&pane_d),
+            "dead D should not be present"
+        );
 
         // Should have logged errors for dead panes
         assert!(log.has_errors(), "should have errors for dead panes");
@@ -2357,7 +2868,17 @@ mod tests {
             .flat_map(|col| col.iter().map(|s| s.as_str()))
             .collect();
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 8, "all 8 panes should be in window");
@@ -2368,7 +2889,11 @@ mod tests {
                 pane
             );
         }
-        assert!(!log.has_errors(), "should have no errors: {:?}", log.entries());
+        assert!(
+            !log.has_errors(),
+            "should have no errors: {:?}",
+            log.entries()
+        );
     }
 
     #[test]
@@ -2381,12 +2906,36 @@ mod tests {
         // Create A in target window, then split to add B and C (3 panes in same window)
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_b = t
-            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
         let pane_c = t
-            .raw_cmd(&["split-window", "-t", &pane_b, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_b,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
 
         // Verify setup: 3 panes in target window
@@ -2397,14 +2946,31 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
-        assert_eq!(final_panes.len(), 2, "should have exactly 2 panes after sync");
+        assert_eq!(
+            final_panes.len(),
+            2,
+            "should have exactly 2 panes after sync"
+        );
         assert!(final_panes.contains(&pane_a), "A should remain");
         assert!(final_panes.contains(&pane_b), "B should remain");
         assert!(!final_panes.contains(&pane_c), "C should be evicted");
-        assert!(t.pane_alive(&pane_c), "C should still be alive (detached, not killed)");
+        assert!(
+            t.pane_alive(&pane_c),
+            "C should still be alive (detached, not killed)"
+        );
         assert!(!log.has_errors(), "no errors: {:?}", log.entries());
 
         // Verify C was detached
@@ -2420,7 +2986,10 @@ mod tests {
         assert_target_panes(&state, &desired, "3 to 2 evict");
         assert_active_window(&state, &target_window, "3 to 2 evict");
         // Started: 1 window (all splits). C evicted to solo -> 2 windows.
-        assert_eq!(state.window_count, 2, "3 to 2 evict: target + C's solo window");
+        assert_eq!(
+            state.window_count, 2,
+            "3 to 2 evict: target + C's solo window"
+        );
         assert_all_alive(&t, &[pane_a, pane_b], "3 to 2 evict");
     }
 
@@ -2433,12 +3002,36 @@ mod tests {
         // Create A in target, split to add X1 and X2 (3 panes in window)
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_x1 = t
-            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
         let pane_x2 = t
-            .raw_cmd(&["split-window", "-t", &pane_x1, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_x1,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
 
         // Create B in a separate window
@@ -2453,7 +3046,17 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 2, "should have exactly 2 panes");
@@ -2474,27 +3077,65 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
 
         // Create B and C in a shared window (not the target)
         let pane_b = t.new_window("test", tmp.path()).unwrap();
         let shared_window = t.pane_window(&pane_b).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &shared_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &shared_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_c = t
-            .raw_cmd(&["split-window", "-t", &pane_b, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_b,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
 
         // Desired layout: [A, B] — B must be pulled from shared window
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should be in target");
         assert!(final_panes.contains(&pane_b), "B should be in target");
         assert!(t.pane_alive(&pane_c), "C should still be alive");
-        assert!(!log.has_errors(), "should have no errors: {:?}", log.entries());
+        assert!(
+            !log.has_errors(),
+            "should have no errors: {:?}",
+            log.entries()
+        );
     }
 
     #[test]
@@ -2511,13 +3152,20 @@ mod tests {
 
         let target_window = t.pane_window(&pane_a).unwrap();
 
-        let pane_columns = vec![
-            vec![pane_a.clone(), pane_b.clone()],
-            vec![pane_c.clone()],
-        ];
+        let pane_columns = vec![vec![pane_a.clone(), pane_b.clone()], vec![pane_c.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str(), pane_c.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 3, "should have exactly 3 panes");
@@ -2537,13 +3185,37 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
 
         let pane_x1 = t
-            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
         let pane_x2 = t
-            .raw_cmd(&["split-window", "-t", &pane_x1, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_x1,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
 
         let pane_b = t.new_window("test", tmp.path()).unwrap();
@@ -2551,7 +3223,17 @@ mod tests {
         let pane_columns = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(final_panes.len(), 2, "should have exactly A and B");
@@ -2584,13 +3266,20 @@ mod tests {
         assert!(initial.contains(&pane_a));
         assert!(initial.contains(&pane_c));
 
-        let pane_columns = vec![
-            vec![pane_b.clone(), pane_d.clone()],
-            vec![pane_a.clone()],
-        ];
+        let pane_columns = vec![vec![pane_b.clone(), pane_d.clone()], vec![pane_a.clone()]];
         let desired: Vec<&str> = vec![pane_b.as_str(), pane_d.as_str(), pane_a.as_str()];
 
-        let log = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A in target");
@@ -2605,7 +3294,10 @@ mod tests {
         assert_target_panes(&state, &desired, "full real world");
         assert_active_window(&state, &target_window, "full real world");
         // Started: 3 windows (A+C, B, D). After: target (A+B+D), C solo -> 2 windows.
-        assert_eq!(state.window_count, 2, "full real world: target + C's solo window");
+        assert_eq!(
+            state.window_count, 2,
+            "full real world: target + C's solo window"
+        );
         assert_all_alive(&t, &[pane_a.clone(), pane_b, pane_d], "full real world");
     }
 
@@ -2630,7 +3322,17 @@ mod tests {
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
         // First reconcile: should consolidate A and B into target_window
-        let log1 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log1 = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         let panes1 = t.list_window_panes(&target_window).unwrap();
         assert_eq!(panes1.len(), 2, "first sync: 2 panes in target");
         assert!(panes1.contains(&pane_a), "first sync: A present");
@@ -2648,7 +3350,17 @@ mod tests {
         let win_count_1 = windows_after_1.lines().count();
 
         // Second reconcile with SAME layout — should be a no-op
-        let log2 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log2 = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         let panes2 = t.list_window_panes(&target_window).unwrap();
         assert_eq!(panes2.len(), 2, "second sync: still 2 panes");
         assert!(panes2.contains(&pane_a), "second sync: A present");
@@ -2675,12 +3387,18 @@ mod tests {
         assert_active_window(&state2, &target_window, "second sync");
 
         // Third reconcile — still stable
-        let log3 = reconcile(&t, &target_window, &pane_columns, &desired, None, None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
-        assert_eq!(
-            log3.mutation_count(),
-            0,
-            "third sync: still no mutations"
-        );
+        let log3 = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(log3.mutation_count(), 0, "third sync: still no mutations");
 
         // Verify active window after third sync
         let state3 = snapshot_state(&t, "test", &target_window);
@@ -2710,7 +3428,17 @@ mod tests {
         // --- Sync 1: layout = [A, C] ---
         let cols1 = vec![vec![pane_a.clone(), pane_c.clone()]];
         let desired1: Vec<&str> = vec![pane_a.as_str(), pane_c.as_str()];
-        let log1 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log1 = reconcile(
+            &t,
+            &target_window,
+            &cols1,
+            &desired1,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log1.has_errors(), "sync1 errors: {:?}", log1.entries());
         let panes1 = t.list_window_panes(&target_window).unwrap();
         assert!(panes1.contains(&pane_a), "sync1: A in target");
@@ -2727,7 +3455,17 @@ mod tests {
         // --- Sync 2: layout = [B, C] (user switched left tab) ---
         let cols2 = vec![vec![pane_b.clone(), pane_c.clone()]];
         let desired2: Vec<&str> = vec![pane_b.as_str(), pane_c.as_str()];
-        let log2 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log2 = reconcile(
+            &t,
+            &target_window,
+            &cols2,
+            &desired2,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log2.has_errors(), "sync2 errors: {:?}", log2.entries());
         let panes2 = t.list_window_panes(&target_window).unwrap();
         assert!(panes2.contains(&pane_b), "sync2: B in target");
@@ -2749,7 +3487,17 @@ mod tests {
         );
 
         // --- Sync 3: back to [A, C] (user switched back) ---
-        let log3 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log3 = reconcile(
+            &t,
+            &target_window,
+            &cols1,
+            &desired1,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log3.has_errors(), "sync3 errors: {:?}", log3.entries());
         let panes3 = t.list_window_panes(&target_window).unwrap();
         assert!(panes3.contains(&pane_a), "sync3: A in target");
@@ -2768,7 +3516,17 @@ mod tests {
         );
 
         // --- Sync 4: [B, C] again ---
-        let log4 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log4 = reconcile(
+            &t,
+            &target_window,
+            &cols2,
+            &desired2,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log4.has_errors(), "sync4 errors: {:?}", log4.entries());
 
         // Verify active window after sync 4
@@ -2805,30 +3563,18 @@ mod tests {
 
     /// Get the active window ID in a tmux session.
     fn active_window(tmux: &IsolatedTmux, session: &str) -> String {
-        tmux.raw_cmd(&[
-            "display-message",
-            "-t",
-            session,
-            "-p",
-            "#{window_id}",
-        ])
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+        tmux.raw_cmd(&["display-message", "-t", session, "-p", "#{window_id}"])
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     }
 
     /// Get the active pane ID in a tmux session.
     fn active_pane(tmux: &IsolatedTmux, session: &str) -> String {
-        tmux.raw_cmd(&[
-            "display-message",
-            "-t",
-            session,
-            "-p",
-            "#{pane_id}",
-        ])
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+        tmux.raw_cmd(&["display-message", "-t", session, "-p", "#{pane_id}"])
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     }
 
     #[test]
@@ -2849,19 +3595,45 @@ mod tests {
         // --- Sync 1: layout = [[A], [C]], focus = A ---
         let cols1 = vec![vec![pane_a.clone()], vec![pane_c.clone()]];
         let desired1: Vec<&str> = vec![pane_a.as_str(), pane_c.as_str()];
-        let log1 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), Some(&pane_a), &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log1 = reconcile(
+            &t,
+            &target_window,
+            &cols1,
+            &desired1,
+            Some("test"),
+            Some(&pane_a),
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log1.has_errors(), "sync1 errors: {:?}", log1.entries());
         let sel1 = active_pane(&t, "test");
-        assert_eq!(sel1, pane_a, "sync1: A (left) should be selected after reconcile");
+        assert_eq!(
+            sel1, pane_a,
+            "sync1: A (left) should be selected after reconcile"
+        );
 
         // --- Sync 2: layout = [[B], [C]], focus = B ---
         let cols2 = vec![vec![pane_b.clone()], vec![pane_c.clone()]];
         let desired2: Vec<&str> = vec![pane_b.as_str(), pane_c.as_str()];
-        let log2 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), Some(&pane_b), &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log2 = reconcile(
+            &t,
+            &target_window,
+            &cols2,
+            &desired2,
+            Some("test"),
+            Some(&pane_b),
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log2.has_errors(), "sync2 errors: {:?}", log2.entries());
         // After reconcile: focus pane (B) should already be selected (attach->select->detach)
         let sel2 = active_pane(&t, "test");
-        assert_eq!(sel2, pane_b, "sync2: B (left) should be selected after reconcile");
+        assert_eq!(
+            sel2, pane_b,
+            "sync2: B (left) should be selected after reconcile"
+        );
 
         // Verify B is actually on the left (first in pane order)
         let ordered = t.list_panes_ordered(&target_window).unwrap();
@@ -2869,20 +3641,46 @@ mod tests {
         assert_eq!(ordered[1], pane_c, "sync2: C should be rightmost pane");
 
         // --- Sync 3: back to [[A], [C]], focus = A ---
-        let log3 = reconcile(&t, &target_window, &cols1, &desired1, Some("test"), Some(&pane_a), &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log3 = reconcile(
+            &t,
+            &target_window,
+            &cols1,
+            &desired1,
+            Some("test"),
+            Some(&pane_a),
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log3.has_errors(), "sync3 errors: {:?}", log3.entries());
         let sel3 = active_pane(&t, "test");
-        assert_eq!(sel3, pane_a, "sync3: A (left) should be selected after reconcile");
+        assert_eq!(
+            sel3, pane_a,
+            "sync3: A (left) should be selected after reconcile"
+        );
 
         let ordered3 = t.list_panes_ordered(&target_window).unwrap();
         assert_eq!(ordered3[0], pane_a, "sync3: A should be leftmost pane");
         assert_eq!(ordered3[1], pane_c, "sync3: C should be rightmost pane");
 
         // --- Sync 4: [[B], [C]] again ---
-        let log4 = reconcile(&t, &target_window, &cols2, &desired2, Some("test"), Some(&pane_b), &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log4 = reconcile(
+            &t,
+            &target_window,
+            &cols2,
+            &desired2,
+            Some("test"),
+            Some(&pane_b),
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log4.has_errors(), "sync4 errors: {:?}", log4.entries());
         let sel4 = active_pane(&t, "test");
-        assert_eq!(sel4, pane_b, "sync4: B (left) should be selected after reconcile");
+        assert_eq!(
+            sel4, pane_b,
+            "sync4: B (left) should be selected after reconcile"
+        );
 
         let ordered4 = t.list_panes_ordered(&target_window).unwrap();
         assert_eq!(ordered4[0], pane_b, "sync4: B should be leftmost pane");
@@ -2894,7 +3692,10 @@ mod tests {
         // Window count stable
         let win_count = count_windows(&t, "test");
         // Expect: target + stash (2), possibly + dead B/A window shells
-        assert!(win_count <= 3, "at most 3 windows: target + stash + 1 shell");
+        assert!(
+            win_count <= 3,
+            "at most 3 windows: target + stash + 1 shell"
+        );
     }
 
     #[test]
@@ -2912,20 +3713,47 @@ mod tests {
 
         // Helper: full sync flow (reconcile with focus + equalize_sizes + select_pane)
         let full_sync = |cols: &[Vec<String>], desired: &[&str], focus: &str, label: &str| {
-            let log = reconcile(&t, &target_window, cols, desired, Some("test"), Some(focus), &dummy_registry_path(), &SyncOptions::default()).unwrap();
-            assert!(!log.has_errors(), "{}: reconcile errors: {:?}", label, log.entries());
+            let log = reconcile(
+                &t,
+                &target_window,
+                cols,
+                desired,
+                Some("test"),
+                Some(focus),
+                &dummy_registry_path(),
+                &SyncOptions::default(),
+            )
+            .unwrap();
+            assert!(
+                !log.has_errors(),
+                "{}: reconcile errors: {:?}",
+                label,
+                log.entries()
+            );
 
             let sel_after_reconcile = active_pane(&t, "test");
-            eprintln!("{}: after reconcile, selected={}", label, sel_after_reconcile);
-            assert_eq!(sel_after_reconcile, focus,
-                "{}: reconcile should pre-select focus pane (attach->select->detach)", label);
+            eprintln!(
+                "{}: after reconcile, selected={}",
+                label, sel_after_reconcile
+            );
+            assert_eq!(
+                sel_after_reconcile, focus,
+                "{}: reconcile should pre-select focus pane (attach->select->detach)",
+                label
+            );
 
             equalize_sizes(&t, cols);
 
             let sel_after_equalize = active_pane(&t, "test");
-            eprintln!("{}: after equalize_sizes, selected={}", label, sel_after_equalize);
-            assert_eq!(sel_after_equalize, focus,
-                "{}: equalize_sizes should not change selected pane", label);
+            eprintln!(
+                "{}: after equalize_sizes, selected={}",
+                label, sel_after_equalize
+            );
+            assert_eq!(
+                sel_after_equalize, focus,
+                "{}: equalize_sizes should not change selected pane",
+                label
+            );
 
             // Final select_pane (as sync does)
             t.select_pane(focus).unwrap();
@@ -2934,8 +3762,13 @@ mod tests {
 
             // Verify the focus pane is in the target window
             let ordered = t.list_panes_ordered(&target_window).unwrap();
-            assert!(ordered.contains(&focus.to_string()),
-                "{}: focus pane {} not in target window {:?}", label, focus, ordered);
+            assert!(
+                ordered.contains(&focus.to_string()),
+                "{}: focus pane {} not in target window {:?}",
+                label,
+                focus,
+                ordered
+            );
         };
 
         // --- Sync 1: [[A], [C]], focus = A (left) ---
@@ -2991,7 +3824,11 @@ mod tests {
         file_to_pane.insert(PathBuf::from("c.md"), "%2".to_string());
 
         let donor = find_column_pane(&layout, Path::new("b.md"), &file_to_pane);
-        assert_eq!(donor, Some("%1".to_string()), "b.md should get a.md's pane (same column)");
+        assert_eq!(
+            donor,
+            Some("%1".to_string()),
+            "b.md should get a.md's pane (same column)"
+        );
     }
 
     #[test]
@@ -3044,7 +3881,11 @@ mod tests {
         file_to_pane.insert(PathBuf::from("c.md"), "%2".to_string());
 
         let result = find_column_pane(&layout, Path::new("b.md"), &file_to_pane);
-        assert_eq!(result, Some("%1".to_string()), "should fall back to a.md's pane in same column");
+        assert_eq!(
+            result,
+            Some("%1".to_string()),
+            "should fall back to a.md's pane in same column"
+        );
     }
 
     #[test]
@@ -3072,7 +3913,10 @@ mod tests {
             .get(&PathBuf::from("plugin.md"))
             .cloned()
             .or_else(|| find_column_pane(&layout, Path::new("plugin.md"), &file_to_pane));
-        assert_eq!(focus_pane, None, "focus should be None -> preserve tmux selection");
+        assert_eq!(
+            focus_pane, None,
+            "focus should be None -> preserve tmux selection"
+        );
     }
 
     #[test]
@@ -3093,7 +3937,11 @@ mod tests {
         file_to_pane.insert(PathBuf::from("dave-franklin.md"), "%65".to_string());
 
         let focus_pane = file_to_pane.get(&PathBuf::from("agent-doc.md")).cloned();
-        assert_eq!(focus_pane, Some("%39".to_string()), "claimed left file -> select left pane");
+        assert_eq!(
+            focus_pane,
+            Some("%39".to_string()),
+            "claimed left file -> select left pane"
+        );
     }
 
     #[test]
@@ -3242,7 +4090,15 @@ mod tests {
         // Create 4 panes in separate windows
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "10"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "10",
+        ]);
         let pane_b = t.new_window("test", tmp.path()).unwrap();
         let pane_c = t.new_window("test", tmp.path()).unwrap();
         let pane_d = t.new_window("test", tmp.path()).unwrap();
@@ -3255,7 +4111,17 @@ mod tests {
             vec![pane_d.clone()],
         ];
         let desired_all: Vec<&str> = vec![&pane_a, &pane_b, &pane_c, &pane_d];
-        let log1 = reconcile(&t, &target_window, &cols_all, &desired_all, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log1 = reconcile(
+            &t,
+            &target_window,
+            &cols_all,
+            &desired_all,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         assert!(!log1.has_errors(), "sync1 errors: {:?}", log1.entries());
 
         // Pre-fill the stash window with extra panes to make it cramped.
@@ -3271,14 +4137,35 @@ mod tests {
         // the fix should fall back to break_pane.
         let cols_ab = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired_ab: Vec<&str> = vec![&pane_a, &pane_b];
-        let log2 = reconcile(&t, &target_window, &cols_ab, &desired_ab, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let log2 = reconcile(
+            &t,
+            &target_window,
+            &cols_ab,
+            &desired_ab,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
-        assert_eq!(final_panes.len(), 2, "should have exactly A and B, got: {:?}", final_panes);
+        assert_eq!(
+            final_panes.len(),
+            2,
+            "should have exactly A and B, got: {:?}",
+            final_panes
+        );
         assert!(final_panes.contains(&pane_a), "A in target");
         assert!(final_panes.contains(&pane_b), "B in target");
-        assert!(t.pane_alive(&pane_c), "C still alive (stashed or broken out)");
-        assert!(t.pane_alive(&pane_d), "D still alive (stashed or broken out)");
+        assert!(
+            t.pane_alive(&pane_c),
+            "C still alive (stashed or broken out)"
+        );
+        assert!(
+            t.pane_alive(&pane_d),
+            "D still alive (stashed or broken out)"
+        );
         assert!(!log2.has_errors(), "sync2 errors: {:?}", log2.entries());
     }
 
@@ -3293,14 +4180,38 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
 
         // Create 2 more panes in the same window (simulating 3 panes)
         let pane_b = t
-            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
         let pane_ghost = t
-            .raw_cmd(&["split-window", "-t", &pane_b, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_b,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
 
         let initial = t.list_window_panes(&target_window).unwrap();
@@ -3312,25 +4223,40 @@ mod tests {
 
         // Use session_name = Some("test") to trigger stash path
         let log = reconcile(
-            &t, &target_window, &pane_columns, &desired,
-            Some("test"), None, &dummy_registry_path(), &SyncOptions::default(),
-        ).unwrap();
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert_eq!(
-            final_panes.len(), 2,
-            "ghost pane should be stashed, got: {:?}", final_panes
+            final_panes.len(),
+            2,
+            "ghost pane should be stashed, got: {:?}",
+            final_panes
         );
         assert!(final_panes.contains(&pane_a), "A in target");
         assert!(final_panes.contains(&pane_b), "B in target");
-        assert!(!final_panes.contains(&pane_ghost), "ghost should not be in target");
+        assert!(
+            !final_panes.contains(&pane_ghost),
+            "ghost should not be in target"
+        );
         assert!(t.pane_alive(&pane_ghost), "ghost still alive (stashed)");
 
         // Verify ghost went to stash window (not a new visible window)
         let stash = t.find_stash_window("test");
         assert!(stash.is_some(), "stash window should exist");
         let stash_panes = t.list_window_panes(&stash.unwrap()).unwrap();
-        assert!(stash_panes.contains(&pane_ghost), "ghost should be in stash window");
+        assert!(
+            stash_panes.contains(&pane_ghost),
+            "ghost should be in stash window"
+        );
 
         assert!(!log.has_errors(), "no errors: {:?}", log.entries());
     }
@@ -3346,11 +4272,25 @@ mod tests {
         // Create two panes
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "50"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ]);
         // Split to create second pane in same window
         let pane_b = t
             .raw_cmd(&[
-                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .unwrap()
             .trim()
@@ -3429,9 +4369,17 @@ mod tests {
             .find(|(p, _)| p == &file_b)
             .map(|(_, id)| id.as_str());
 
-        assert_eq!(pane_for_a, Some(pane_a.as_str()), "registered file gets its pane");
+        assert_eq!(
+            pane_for_a,
+            Some(pane_a.as_str()),
+            "registered file gets its pane"
+        );
         assert!(pane_for_b.is_some(), "unregistered file gets a spare pane");
-        assert_eq!(pane_for_b, Some(pane_b.as_str()), "unregistered file gets the spare pane");
+        assert_eq!(
+            pane_for_b,
+            Some(pane_b.as_str()),
+            "unregistered file gets the spare pane"
+        );
     }
 
     #[test]
@@ -3443,10 +4391,24 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "50"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ]);
         let pane_b = t
             .raw_cmd(&[
-                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .unwrap()
             .trim()
@@ -3551,10 +4513,24 @@ mod tests {
         // Create session "main" with pane A in target window, and pane X (unwanted) via split
         let pane_a = t.new_session("main", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_x = t
             .raw_cmd(&[
-                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .unwrap();
 
@@ -3571,9 +4547,16 @@ mod tests {
 
         // Pass session_name="main" so the session validation logs a warning
         let log = reconcile(
-            &t, &target_window, &pane_columns, &desired,
-            Some("main"), None, &dummy_registry_path(), &SyncOptions::default(),
-        ).unwrap();
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            Some("main"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // Cross-session operations should be ALLOWED with SCOPE_CROSS warning
         let has_scope_cross = log.entries().iter().any(|e| e.phase == "SCOPE_CROSS");
@@ -3586,7 +4569,10 @@ mod tests {
         // B should now be in the target window (cross-session join allowed)
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should remain in target");
-        assert!(final_panes.contains(&pane_b), "B should be joined from different session");
+        assert!(
+            final_panes.contains(&pane_b),
+            "B should be joined from different session"
+        );
     }
 
     #[test]
@@ -3598,10 +4584,24 @@ mod tests {
         // Create session with A and X in target window, B in separate window
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_x = t
             .raw_cmd(&[
-                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .unwrap();
         let pane_b = t.new_window("test", tmp.path()).unwrap();
@@ -3611,9 +4611,16 @@ mod tests {
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
         let log = reconcile(
-            &t, &target_window, &pane_columns, &desired,
-            Some("test"), None, &dummy_registry_path(), &SyncOptions::default(),
-        ).unwrap();
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // SWAP fast path should be used (same session)
         let has_swap = log.entries().iter().any(|e| e.phase == "SWAP" && e.ok);
@@ -3623,7 +4630,10 @@ mod tests {
             "SWAP should succeed when all panes are in the same session, got: {:?}",
             log.entries()
         );
-        assert!(!has_swap_skip, "should NOT skip swap for same-session panes");
+        assert!(
+            !has_swap_skip,
+            "should NOT skip swap for same-session panes"
+        );
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a));
@@ -3638,10 +4648,24 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let pane_x = t
             .raw_cmd(&[
-                "split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}",
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
             ])
             .unwrap();
         let pane_b = t.new_window("test", tmp.path()).unwrap();
@@ -3651,12 +4675,23 @@ mod tests {
 
         // session_name = None — no constraint
         let log = reconcile(
-            &t, &target_window, &pane_columns, &desired,
-            None, None, &dummy_registry_path(), &SyncOptions::default(),
-        ).unwrap();
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            None,
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         let has_swap = log.entries().iter().any(|e| e.phase == "SWAP" && e.ok);
-        assert!(has_swap, "SWAP should work with no session constraint: {:?}", log.entries());
+        assert!(
+            has_swap,
+            "SWAP should work with no session constraint: {:?}",
+            log.entries()
+        );
     }
 
     #[test]
@@ -3669,7 +4704,15 @@ mod tests {
         // Session "main" with pane A
         let pane_a = t.new_session("main", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
 
         // Session "other" with pane B
         let pane_b = t.new_session("other", tmp.path()).unwrap();
@@ -3679,9 +4722,16 @@ mod tests {
         let desired: Vec<&str> = vec![pane_a.as_str(), pane_b.as_str()];
 
         let log = reconcile(
-            &t, &target_window, &pane_columns, &desired,
-            Some("main"), None, &dummy_registry_path(), &SyncOptions::default(),
-        ).unwrap();
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            Some("main"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // Verify cross-session join was allowed with SCOPE_CROSS warning
         let has_scope_cross = log.entries().iter().any(|e| e.phase == "SCOPE_CROSS");
@@ -3694,7 +4744,10 @@ mod tests {
         // B should now be in target window (cross-session join succeeded)
         let final_panes = t.list_window_panes(&target_window).unwrap();
         assert!(final_panes.contains(&pane_a), "A should remain");
-        assert!(final_panes.contains(&pane_b), "B should be joined from different session");
+        assert!(
+            final_panes.contains(&pane_b),
+            "B should be joined from different session"
+        );
     }
 
     // ── Overflow stash tests ──
@@ -3709,13 +4762,31 @@ mod tests {
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
         // Make window tall enough for initial setup
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "40"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "40",
+        ]);
         let pane_b = t.new_window("test", tmp.path()).unwrap();
 
         // Sync both panes into one window
         let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![&pane_a, &pane_b];
-        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let _log = reconcile(
+            &t,
+            &target_window,
+            &cols,
+            &desired,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         equalize_sizes(&t, &cols);
 
         // Both should be in the window
@@ -3731,9 +4802,17 @@ mod tests {
 
         // After overflow: one pane should be stashed (pane_b since pane_a is focus)
         let final_panes = t.list_window_panes(&target_window).unwrap();
-        assert_eq!(final_panes.len(), 1, "should have 1 pane after overflow stash, got {:?}", final_panes);
+        assert_eq!(
+            final_panes.len(),
+            1,
+            "should have 1 pane after overflow stash, got {:?}",
+            final_panes
+        );
         assert!(final_panes.contains(&pane_a), "focus pane A should remain");
-        assert!(t.pane_alive(&pane_b), "pane B should still be alive (stashed)");
+        assert!(
+            t.pane_alive(&pane_b),
+            "pane B should still be alive (stashed)"
+        );
     }
 
     #[test]
@@ -3744,12 +4823,30 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "40"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "40",
+        ]);
         let pane_b = t.new_window("test", tmp.path()).unwrap();
 
         let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![&pane_a, &pane_b];
-        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let _log = reconcile(
+            &t,
+            &target_window,
+            &cols,
+            &desired,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
 
         // Shrink
         let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-y", "8"]);
@@ -3759,9 +4856,17 @@ mod tests {
         stash_overflow_panes(&t, &mut cols_mut, "test", &target_window, Some(&pane_b));
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
-        assert_eq!(final_panes.len(), 1, "should have 1 pane, got {:?}", final_panes);
+        assert_eq!(
+            final_panes.len(),
+            1,
+            "should have 1 pane, got {:?}",
+            final_panes
+        );
         assert!(final_panes.contains(&pane_b), "focus pane B should remain");
-        assert!(t.pane_alive(&pane_a), "pane A should still be alive (stashed)");
+        assert!(
+            t.pane_alive(&pane_a),
+            "pane A should still be alive (stashed)"
+        );
     }
 
     #[test]
@@ -3772,12 +4877,30 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "40"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "40",
+        ]);
         let pane_b = t.new_window("test", tmp.path()).unwrap();
 
         let cols = vec![vec![pane_a.clone()], vec![pane_b.clone()]];
         let desired: Vec<&str> = vec![&pane_a, &pane_b];
-        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let _log = reconcile(
+            &t,
+            &target_window,
+            &cols,
+            &desired,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         equalize_sizes(&t, &cols);
 
         let mut cols_mut = cols.clone();
@@ -3785,7 +4908,11 @@ mod tests {
 
         // No panes stashed — both should remain
         let final_panes = t.list_window_panes(&target_window).unwrap();
-        assert_eq!(final_panes.len(), 2, "both panes should remain when window is large enough");
+        assert_eq!(
+            final_panes.len(),
+            2,
+            "both panes should remain when window is large enough"
+        );
     }
 
     #[test]
@@ -3797,14 +4924,32 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "40"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "40",
+        ]);
         let pane_b = t.new_window("test", tmp.path()).unwrap();
         let pane_c = t.new_window("test", tmp.path()).unwrap();
 
         // Single column with 3 panes stacked
         let cols = vec![vec![pane_a.clone(), pane_b.clone(), pane_c.clone()]];
         let desired: Vec<&str> = vec![&pane_a, &pane_b, &pane_c];
-        let _log = reconcile(&t, &target_window, &cols, &desired, Some("test"), None, &dummy_registry_path(), &SyncOptions::default()).unwrap();
+        let _log = reconcile(
+            &t,
+            &target_window,
+            &cols,
+            &desired,
+            Some("test"),
+            None,
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
         equalize_sizes(&t, &cols);
 
         // Shrink to 15 rows — only 1 pane can fit at MIN_PANE_HEIGHT=10
@@ -3814,7 +4959,12 @@ mod tests {
         stash_overflow_panes(&t, &mut cols_mut, "test", &target_window, Some(&pane_a));
 
         let final_panes = t.list_window_panes(&target_window).unwrap();
-        assert_eq!(final_panes.len(), 1, "only 1 pane should fit in 15-row window, got {:?}", final_panes);
+        assert_eq!(
+            final_panes.len(),
+            1,
+            "only 1 pane should fit in 15-row window, got {:?}",
+            final_panes
+        );
         assert!(final_panes.contains(&pane_a), "focus pane A should remain");
         assert!(t.pane_alive(&pane_b), "B still alive");
         assert!(t.pane_alive(&pane_c), "C still alive");
@@ -3830,21 +4980,49 @@ mod tests {
         // Create 3 panes in the same window (simulating a previous 3-pane layout)
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "300", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "300",
+            "-y",
+            "60",
+        ]);
         let pane_b = t
-            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap()
             .trim()
             .to_string();
         let pane_c = t
-            .raw_cmd(&["split-window", "-t", &pane_b, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_b,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap()
             .trim()
             .to_string();
 
         // Verify setup: 3 panes in the target window
         let initial_panes = t.list_window_panes(&target_window).unwrap();
-        assert_eq!(initial_panes.len(), 3, "should start with 3 panes in window");
+        assert_eq!(
+            initial_panes.len(),
+            3,
+            "should start with 3 panes in window"
+        );
 
         // Create test files: one managed (right column), one unmanaged (left column)
         let file_managed = tmp.path().join("managed.md");
@@ -3906,7 +5084,10 @@ mod tests {
             "only resolved pane should remain after reconcile, got {:?}",
             final_panes
         );
-        assert!(final_panes.contains(&pane_a), "resolved pane_a should be in window");
+        assert!(
+            final_panes.contains(&pane_a),
+            "resolved pane_a should be in window"
+        );
 
         // Stashed panes should still be alive
         assert!(t.pane_alive(&pane_b), "pane_b should be alive in stash");

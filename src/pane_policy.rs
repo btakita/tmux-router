@@ -134,7 +134,10 @@ mod tests {
         let pane1 = iso.new_session("test", Path::new("/tmp")).unwrap();
         let pane2 = iso.new_window("test", Path::new("/tmp")).unwrap();
         let result = PaneMoveOp::new(&iso, &pane2, &pane1).join("-dh");
-        assert!(result.is_ok(), "same-session join should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "same-session join should succeed: {result:?}"
+        );
     }
 
     #[test]
@@ -145,7 +148,10 @@ mod tests {
         // Join into same window first (swap requires panes in same session)
         iso.join_pane(&pane2, &pane1, "-dh").unwrap();
         let result = PaneMoveOp::new(&iso, &pane2, &pane1).swap();
-        assert!(result.is_ok(), "same-session swap should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "same-session swap should succeed: {result:?}"
+        );
     }
 
     #[test]
@@ -154,7 +160,10 @@ mod tests {
         let pane1 = iso.new_session("sess-a", Path::new("/tmp")).unwrap();
         let pane2 = iso.new_session("sess-b", Path::new("/tmp")).unwrap();
         let result = PaneMoveOp::new(&iso, &pane2, &pane1).join("-dh");
-        assert!(result.is_err(), "cross-session join should be denied by default");
+        assert!(
+            result.is_err(),
+            "cross-session join should be denied by default"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("cross-session pane move denied"),
@@ -168,7 +177,10 @@ mod tests {
         let pane1 = iso.new_session("sess-a", Path::new("/tmp")).unwrap();
         let pane2 = iso.new_session("sess-b", Path::new("/tmp")).unwrap();
         let result = PaneMoveOp::new(&iso, &pane2, &pane1).swap();
-        assert!(result.is_err(), "cross-session swap should be denied by default");
+        assert!(
+            result.is_err(),
+            "cross-session swap should be denied by default"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("cross-session pane move denied"),
@@ -190,7 +202,10 @@ mod tests {
         );
         // Verify pane2 is now in sess-a
         let sess = iso.pane_session(&pane2).unwrap();
-        assert_eq!(sess, "sess-a", "pane should be in target session after join");
+        assert_eq!(
+            sess, "sess-a",
+            "pane should be in target session after join"
+        );
     }
 
     #[test]
@@ -202,6 +217,9 @@ mod tests {
         iso.join_pane(&pane2, &pane1, "-dh").unwrap();
         // Now both are in sess-a — swap should succeed with Deny too
         let result = PaneMoveOp::new(&iso, &pane2, &pane1).swap();
-        assert!(result.is_ok(), "same-session swap after join should succeed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "same-session swap after join should succeed: {result:?}"
+        );
     }
 }

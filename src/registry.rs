@@ -151,8 +151,7 @@ pub fn save_registry(path: &Path, registry: &Registry) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let content = serde_json::to_string_pretty(registry)?;
-    std::fs::write(path, content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -166,7 +165,11 @@ pub fn lookup(registry_path: &Path, key: &str) -> Result<Option<String>> {
 /// Called after break_pane or join_pane moves a pane to a different window.
 ///
 /// Acquires an exclusive advisory lock for the duration of the read-modify-write.
-pub fn update_window_for_entry(registry_path: &Path, pane_id: &str, new_window: &str) -> Result<()> {
+pub fn update_window_for_entry(
+    registry_path: &Path,
+    pane_id: &str,
+    new_window: &str,
+) -> Result<()> {
     let _lock = RegistryLock::acquire(registry_path)?;
     let mut registry = load_registry(registry_path)?;
     let mut changed = false;

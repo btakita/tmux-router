@@ -2,9 +2,9 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-use tmux_router::tmux::Tmux;
 use tmux_router::registry;
 use tmux_router::sync::FileResolution;
+use tmux_router::tmux::Tmux;
 
 /// Declarative tmux pane routing — sync editor layouts to tmux.
 #[derive(Parser)]
@@ -84,7 +84,12 @@ fn main() -> Result<()> {
     let tmux = Tmux::default_server();
 
     match cli.command {
-        Command::Sync { cols, window, focus, session: _ } => {
+        Command::Sync {
+            cols,
+            window,
+            focus,
+            session: _,
+        } => {
             let resolve = |_path: &std::path::Path| -> Option<FileResolution> {
                 // Standalone CLI: all files are unmanaged (no UUID mapping).
                 // Users can register files first, then sync will find them.
@@ -105,14 +110,17 @@ fn main() -> Result<()> {
         }
         Command::Register { file, pane } => {
             let mut reg = registry::load_registry(&cli.registry)?;
-            reg.insert(file.clone(), registry::RegistryEntry {
-                pane: pane.clone(),
-                pid: 0,
-                cwd: String::new(),
-                started: chrono_now(),
-                file: file.clone(),
-                window: tmux.pane_window(&pane).unwrap_or_default(),
-            });
+            reg.insert(
+                file.clone(),
+                registry::RegistryEntry {
+                    pane: pane.clone(),
+                    pid: 0,
+                    cwd: String::new(),
+                    started: chrono_now(),
+                    file: file.clone(),
+                    window: tmux.pane_window(&pane).unwrap_or_default(),
+                },
+            );
             registry::save_registry(&cli.registry, &reg)?;
             println!("registered {} → {}", file, pane);
         }
@@ -132,8 +140,15 @@ fn main() -> Result<()> {
                 return Ok(());
             }
             for (key, entry) in &reg {
-                let alive = if tmux.pane_alive(&entry.pane) { "alive" } else { "dead" };
-                println!("{} → {} [{}] window={}", key, entry.pane, alive, entry.window);
+                let alive = if tmux.pane_alive(&entry.pane) {
+                    "alive"
+                } else {
+                    "dead"
+                };
+                println!(
+                    "{} → {} [{}] window={}",
+                    key, entry.pane, alive, entry.window
+                );
             }
         }
         Command::Resync => {
@@ -152,12 +167,18 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Send { target, text, no_enter, raw } => {
+        Command::Send {
+            target,
+            text,
+            no_enter,
+            raw,
+        } => {
             let pane = resolve_target(&cli.registry, &target)?;
             if raw {
                 tmux.send_keys_raw(&pane, &text)?;
             } else if no_enter {
-                let status = tmux.cmd()
+                let status = tmux
+                    .cmd()
                     .args(["send-keys", "-t", &pane, "-l", &text])
                     .status()?;
                 if !status.success() {
@@ -185,7 +206,10 @@ fn resolve_target(registry_path: &std::path::Path, target: &str) -> Result<Strin
     let reg = registry::load_registry(registry_path)?;
     match reg.get(target) {
         Some(entry) => Ok(entry.pane.clone()),
-        None => anyhow::bail!("'{}' not found in registry (use %<id> for raw pane IDs)", target),
+        None => anyhow::bail!(
+            "'{}' not found in registry (use %<id> for raw pane IDs)",
+            target
+        ),
     }
 }
 
