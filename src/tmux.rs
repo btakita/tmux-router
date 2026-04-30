@@ -9,7 +9,10 @@
 //!   default server (`Tmux::default_server()`) or a named socket for isolation.
 //! - `Tmux::cmd()` emits a `Command` pre-configured with `-L <socket> -f /dev/null`
 //!   when `server_socket` is set, or bare `tmux` for the default server.
-//! - `pane_alive(pane_id)` — returns true iff `pane_id` appears in `list-panes -a`.
+//! - `pane_alive(pane_id)` — returns true iff `pane_id` still exists and `pane_dead=0`
+//!   (retained dead panes from `remain-on-exit` are not considered alive).
+//! - `pane_dead(pane_id)` — returns true iff tmux still retains the pane but the child
+//!   process has exited (`pane_dead=1`).
 //! - `running()` — returns true iff the server has at least one session.
 //! - `session_exists(name)` / `session_alive(name)` — check session presence by name.
 //! - `new_session(name, cwd)` — creates a detached session and returns its first pane ID.
@@ -50,6 +53,10 @@
 //! - `auto_start(session, cwd)` — creates a session if the server or session is absent,
 //!   otherwise creates a new window; returns the new pane ID.
 //! - `capture_pane(pane_id, lines)` — captures visible content or N scrollback lines.
+//! - `enable_remain_on_exit(pane_id)` — enables `remain-on-exit on` for the pane's
+//!   current window so dead panes remain inspectable until cleanup.
+//! - `pane_dead_status(pane_id)` — returns tmux's retained dead-pane exit status when
+//!   a pane is dead and still present.
 //! - `raw_cmd(args)` — escape hatch for arbitrary tmux commands; returns trimmed stdout.
 //! - `list_all_windows()` / `list_all_panes()` — global state summaries for logging.
 //! - `dump_tmux_tree()` — formats a full session→window→pane tree as a string.
@@ -64,6 +71,8 @@
 //! - All methods that mutate tmux state return `Result<_>` and propagate errors;
 //!   callers must handle failures explicitly — no silent swallows except in boolean
 //!   probe methods (`pane_alive`, `running`, `session_exists`, `session_alive`).
+//! - `pane_alive` excludes retained dead panes; callers that need dead-pane cleanup or
+//!   provenance must probe `pane_dead` / `pane_dead_status` explicitly.
 //! - `kill_pane` never destroys an entire session silently; it returns `Err` when
 //!   the kill would be session-destructive.
 //! - `stash_pane` never silently drops a pane; on all failure paths it either joins,
@@ -129,19 +138,37 @@ impl Tmux {
         cmd
     }
 
-    /// Check if a tmux pane is alive.
-    pub fn pane_alive(&self, pane_id: &str) -> bool {
+    fn pane_dead_flag(&self, pane_id: &str) -> Option<bool> {
         let output = self
             .cmd()
-            .args(["list-panes", "-a", "-F", "#{pane_id}"])
-            .output();
-        match output {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                stdout.lines().any(|line| line.trim() == pane_id)
-            }
-            Err(_) => false,
+            .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
         }
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut parts = line.splitn(2, '\t');
+            let Some(id) = parts.next() else {
+                continue;
+            };
+            if id.trim() != pane_id {
+                continue;
+            }
+            let dead = parts.next().unwrap_or("0").trim();
+            return Some(dead == "1");
+        }
+        None
+    }
+
+    /// Check if a tmux pane is alive.
+    pub fn pane_alive(&self, pane_id: &str) -> bool {
+        matches!(self.pane_dead_flag(pane_id), Some(false))
+    }
+
+    /// Check if a tmux pane still exists but its child has already exited.
+    pub fn pane_dead(&self, pane_id: &str) -> bool {
+        matches!(self.pane_dead_flag(pane_id), Some(true))
     }
 
     /// Get all alive pane IDs in a single subprocess call.
@@ -150,14 +177,22 @@ impl Tmux {
     pub fn alive_pane_ids(&self) -> std::collections::HashSet<String> {
         let output = self
             .cmd()
-            .args(["list-panes", "-a", "-F", "#{pane_id}"])
+            .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
             .output();
         match output {
             Ok(out) if out.status.success() => {
                 String::from_utf8_lossy(&out.stdout)
                     .lines()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
+                    .filter_map(|line| {
+                        let mut parts = line.splitn(2, '\t');
+                        let pane_id = parts.next()?.trim();
+                        let pane_dead = parts.next().unwrap_or("0").trim();
+                        if pane_id.is_empty() || pane_dead == "1" {
+                            None
+                        } else {
+                            Some(pane_id.to_string())
+                        }
+                    })
                     .collect()
             }
             _ => std::collections::HashSet::new(),
@@ -1015,6 +1050,45 @@ impl Tmux {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
+    /// Enable dead-pane retention on the pane's current window.
+    pub fn enable_remain_on_exit(&self, pane_id: &str) -> Result<()> {
+        let window_id = self.pane_window(pane_id)?;
+        let status = self
+            .cmd()
+            .args(["set-option", "-t", &window_id, "remain-on-exit", "on"])
+            .status()
+            .context("failed to run tmux set-option remain-on-exit")?;
+        if !status.success() {
+            anyhow::bail!("tmux set-option remain-on-exit failed for {}", window_id);
+        }
+        Ok(())
+    }
+
+    /// Return the retained dead-pane exit status when available.
+    pub fn pane_dead_status(&self, pane_id: &str) -> Result<Option<String>> {
+        if !self.pane_dead(pane_id) {
+            return Ok(None);
+        }
+        let output = self
+            .cmd()
+            .args(["display-message", "-t", pane_id, "-p", "#{pane_dead_status}"])
+            .output()
+            .context("failed to run tmux display-message for pane_dead_status")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux display-message failed for pane_dead_status on {}: {}",
+                pane_id,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if status.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(status))
+        }
+    }
+
     /// Send raw keys to a pane without pressing Enter.
     ///
     /// Unlike `send_keys()`, this sends keystrokes without appending Enter
@@ -1206,6 +1280,20 @@ mod tmux_tests {
     use std::path::Path;
     use std::time::Duration;
 
+    fn wait_for<F>(timeout: Duration, mut predicate: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if predicate() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        predicate()
+    }
+
     #[test]
     fn ensure_pane_in_session_accepts_matching_session() {
         let iso = IsolatedTmux::new("tmux-ensure-session-ok");
@@ -1239,5 +1327,23 @@ mod tmux_tests {
             content.contains("hello"),
             "pane should contain submitted input after send_key Enter: {content}"
         );
+    }
+
+    #[test]
+    fn pane_alive_excludes_retained_dead_panes() {
+        let iso = IsolatedTmux::new("tmux-pane-dead-retained");
+        let pane = iso.new_session("sess-dead", Path::new("/tmp")).unwrap();
+        iso.enable_remain_on_exit(&pane).unwrap();
+        iso.send_keys(&pane, "exit 7").unwrap();
+
+        assert!(
+            wait_for(Duration::from_secs(3), || iso.pane_dead(&pane)),
+            "pane should be retained as dead after exit"
+        );
+        assert!(
+            !iso.pane_alive(&pane),
+            "retained dead pane should not be treated as alive"
+        );
+        assert_eq!(iso.pane_dead_status(&pane).unwrap().as_deref(), Some("7"));
     }
 }
