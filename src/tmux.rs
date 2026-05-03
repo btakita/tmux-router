@@ -30,7 +30,8 @@
 //!   (`-h`/`-v`, `-d`) and returns the new pane ID.
 //! - `join_pane(src, dst, split_flag)` — moves `src` into `dst`'s window.
 //! - `swap_pane(src, dst)` — atomically swaps two panes without focus change (`-d`).
-//! - `break_pane(pane_id)` — breaks a pane into a new detached window.
+//! - `break_pane(pane_id)` — breaks a pane into a new detached window in the
+//!   pane's existing tmux session.
 //! - `kill_pane(pane_id)` — kills a pane; refuses (returns `Err`) if it is the sole
 //!   pane in the sole window of its session to prevent accidental session destruction.
 //! - `session_window_count(session)` — counts windows in a session.
@@ -102,6 +103,8 @@
 //!   and returns a non-empty pane ID.
 //! - `auto_start_creates_window`: with an existing session, `auto_start` adds a window
 //!   rather than a new session.
+//! - `break_pane_preserves_source_session`: breaking a pane while another tmux session is
+//!   current still creates the new window in the source pane's original session.
 //! - `stash_pane_fallback`: when `join_pane` fails (pane too small), `stash_pane`
 //!   calls `break_pane_to_stash` and names the overflow window "stash".
 //! - `isolated_tmux_cleanup`: dropping `IsolatedTmux` kills the server; subsequent
@@ -393,11 +396,15 @@ impl Tmux {
         Ok(())
     }
 
-    /// Break a pane out of its window into a new window.
+    /// Break a pane out of its window into a new window in the same session.
     pub fn break_pane(&self, pane_id: &str) -> Result<()> {
+        let session_name = self
+            .pane_session(pane_id)
+            .with_context(|| format!("failed to resolve tmux session for pane {}", pane_id))?;
+        let target = format!("{}:", session_name);
         let status = self
             .cmd()
-            .args(["break-pane", "-s", pane_id, "-d"])
+            .args(["break-pane", "-s", pane_id, "-t", &target, "-d"])
             .status()
             .context("failed to run tmux break-pane")?;
         if !status.success() {
@@ -1358,5 +1365,28 @@ mod tmux_tests {
             "pane should still be retained as dead after exiting from stash"
         );
         assert_eq!(iso.pane_dead_status(&pane2).unwrap().as_deref(), Some("17"));
+    }
+
+    #[test]
+    fn break_pane_preserves_source_session() {
+        let iso = IsolatedTmux::new("tmux-break-pane-preserve-session");
+        let cwd = Path::new("/tmp");
+        let pane1 = iso.new_session("4", cwd).unwrap();
+        let pane = iso.split_window(&pane1, cwd, "-dh").unwrap();
+        let original_window = iso.pane_window(&pane).unwrap();
+        let _other = iso.new_session("1", cwd).unwrap();
+
+        iso.break_pane(&pane).unwrap();
+
+        let new_window = iso.pane_window(&pane).unwrap();
+        assert_ne!(
+            new_window, original_window,
+            "break-pane should move the pane into a new window"
+        );
+        assert_eq!(
+            iso.pane_session(&pane).unwrap(),
+            "4",
+            "breaking a pane should keep it in its source session even when another session is current"
+        );
     }
 }
