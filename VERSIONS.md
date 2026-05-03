@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Callers can now block ephemeral donor/spare-pane assignment for specific unresolved files.** `SyncOptions` now exposes an `allow_unresolved_pane_assignment` callback, and `sync` skips both same-column donor reuse and target-window spare-pane reuse when the caller rejects a file. This lets higher-level tools fail closed for managed-but-unresolved documents instead of silently aliasing another live pane into that column. Added a regression that blocks spare-pane reuse for a missing left-column file.
 - **Session/key primitives extracted from agent-doc.** `Tmux` now owns `send_key()` and `ensure_pane_in_session()`, so sibling projects can reuse single-key dispatch and fail-closed session checks without shelling out for their own wrappers.
 
 - **Pane-local `remain-on-exit` now survives stash/rescue moves.** `Tmux::enable_remain_on_exit()` now sets the option at pane scope (`set-option -p -t <pane>`) instead of on the original window, so a pane moved with `join-pane` into a stash window still remains inspectable if its process exits later. Added a regression test that stashes a pane first, then exits it, and proves tmux retains the dead pane plus its exit status.

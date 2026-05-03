@@ -443,11 +443,19 @@ pub struct SyncOptions<'a> {
     /// and should NOT be stashed during the DETACH phase.
     /// When `None`, all unwanted panes are eligible for stashing.
     pub protect_pane: Option<&'a dyn Fn(&str) -> bool>,
+    /// Callback to decide whether an unresolved managed file may borrow a
+    /// donor pane from the same column or a spare pane from the target window.
+    /// Returns `true` to allow ephemeral assignment, `false` to keep the file
+    /// unresolved for this sync cycle.
+    pub allow_unresolved_pane_assignment: Option<&'a dyn Fn(&Path) -> bool>,
 }
 
 impl<'a> Default for SyncOptions<'a> {
     fn default() -> Self {
-        Self { protect_pane: None }
+        Self {
+            protect_pane: None,
+            allow_unresolved_pane_assignment: None,
+        }
     }
 }
 
@@ -493,6 +501,12 @@ pub fn sync_with_options(
 ) -> Result<SyncResult> {
     let layout = Layout::parse(col_args)?;
     let all_files = layout.all_files();
+    let allow_unresolved_pane_assignment = |file: &Path| {
+        options
+            .allow_unresolved_pane_assignment
+            .map(|callback| callback(file))
+            .unwrap_or(true)
+    };
 
     // Log comprehensive tmux tree at sync start
     if let Ok(tree) = tmux.dump_tmux_tree() {
@@ -578,6 +592,13 @@ pub fn sync_with_options(
     // SAME column only. This is ephemeral — not written to registry.
     // Same-column-only prevents cross-column focus jumps.
     for file in &unresolved_files {
+        if !allow_unresolved_pane_assignment(file) {
+            eprintln!(
+                "blocking ephemeral pane assignment for {} (caller policy)",
+                file.display()
+            );
+            continue;
+        }
         if let Some(donor_pane) = find_column_pane(&layout, file, &file_to_pane) {
             eprintln!(
                 "auto-register {} → {} (in-memory, same column)",
@@ -621,6 +642,13 @@ pub fn sync_with_options(
                     .collect();
 
                 for file in &still_unresolved {
+                    if !allow_unresolved_pane_assignment(file) {
+                        eprintln!(
+                            "blocking spare pane assignment for {} (caller policy)",
+                            file.display()
+                        );
+                        continue;
+                    }
                     if let Some(pane_id) = spare_panes.pop() {
                         eprintln!(
                             "auto-assign {} → {} (spare pane in window {})",
@@ -5100,5 +5128,101 @@ mod tests {
         // Stashed panes should still be alive
         assert!(t.pane_alive(&pane_b), "pane_b should be alive in stash");
         assert!(t.pane_alive(&pane_c), "pane_c should be alive in stash");
+    }
+
+    #[test]
+    fn blocked_unresolved_file_does_not_borrow_spare_pane() {
+        let t = IsolatedTmux::new("sync-test-block-unresolved-spare");
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let pane_b = t
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
+            .unwrap()
+            .trim()
+            .to_string();
+
+        let file_left = tmp.path().join("left.md");
+        let file_right = tmp.path().join("right.md");
+        std::fs::write(&file_left, "# Left\n").unwrap();
+        std::fs::write(&file_right, "# Right\n").unwrap();
+
+        let registry_path = tmp.path().join("registry.json");
+        let mut registry = crate::registry::Registry::new();
+        registry.insert(
+            "session-right".to_string(),
+            crate::registry::RegistryEntry {
+                pane: pane_b.clone(),
+                pid: std::process::id(),
+                cwd: tmp.path().to_string_lossy().to_string(),
+                started: String::new(),
+                session_id: "session-right".to_string(),
+                file: file_right.to_string_lossy().to_string(),
+                window: target_window.clone(),
+                supervisor_instance_id: String::new(),
+            },
+        );
+        crate::registry::save_registry(&registry_path, &registry).unwrap();
+
+        let col_args = vec![
+            file_left.to_string_lossy().to_string(),
+            file_right.to_string_lossy().to_string(),
+        ];
+        let resolve_file = |path: &Path| -> Option<FileResolution> {
+            if path == file_left {
+                Some(FileResolution::Registered {
+                    key: "session-left".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else if path == file_right {
+                Some(FileResolution::Registered {
+                    key: "session-right".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else {
+                None
+            }
+        };
+        let allow_unresolved_pane_assignment = |path: &Path| path != file_left.as_path();
+        let options = SyncOptions {
+            protect_pane: None,
+            allow_unresolved_pane_assignment: Some(&allow_unresolved_pane_assignment),
+        };
+
+        let result = sync_with_options(
+            &col_args,
+            Some(&target_window),
+            Some(file_left.to_string_lossy().as_ref()),
+            &t,
+            &registry_path,
+            &resolve_file,
+            &options,
+        )
+        .unwrap();
+
+        assert!(
+            result.file_panes.iter().all(|(path, _)| path != &file_left),
+            "blocked unresolved file should stay unresolved instead of borrowing a spare pane"
+        );
+
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(
+            final_panes,
+            vec![pane_b.clone()],
+            "only the provably resolved pane should remain visible after reconcile"
+        );
+        assert!(
+            t.pane_alive(&pane_a),
+            "spare pane should be stashed, not killed"
+        );
     }
 }
