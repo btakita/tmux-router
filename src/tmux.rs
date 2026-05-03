@@ -843,7 +843,7 @@ impl Tmux {
         Ok(())
     }
 
-    /// Find ALL windows named "stash" in the session (primary + overflow).
+    /// Find ALL stash windows in the session (primary + overflow).
     pub fn find_all_stash_windows(&self, session_name: &str) -> Vec<String> {
         let output = match self
             .cmd()
@@ -865,7 +865,7 @@ impl Tmux {
                 let mut parts = line.splitn(2, ' ');
                 let window_id = parts.next()?;
                 let window_name = parts.next().unwrap_or("");
-                if window_name == "stash" {
+                if window_name == "stash" || window_name.starts_with("stash-") {
                     Some(window_id.to_string())
                 } else {
                     None
@@ -1387,6 +1387,24 @@ mod tmux_tests {
             iso.pane_session(&pane).unwrap(),
             "4",
             "breaking a pane should keep it in its source session even when another session is current"
+        );
+    }
+
+    #[test]
+    fn find_all_stash_windows_includes_overflow() {
+        let iso = IsolatedTmux::new("tmux-find-all-stash-windows");
+        let cwd = Path::new("/tmp");
+        let pane = iso.new_session("stash-test", cwd).unwrap();
+        let overflow = iso.split_window(&pane, cwd, "-dh").unwrap();
+
+        let _ = iso.raw_cmd(&["rename-window", "-t", "stash-test:0", "stash"]);
+        iso.break_pane_to_stash(&overflow, "stash-test").unwrap();
+
+        let stash_windows = iso.find_all_stash_windows("stash-test");
+        assert!(
+            stash_windows.len() >= 2,
+            "primary and overflow stash windows should both be discovered, got {:?}",
+            stash_windows
         );
     }
 }
