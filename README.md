@@ -148,7 +148,7 @@ sync(
     },
 )?;
 
-// Send text to a pane
+// Send text to a pane in one tmux submit invocation (literal text + Enter)
 tmux.send_keys("%5", "hello world")?;
 
 // Capture pane content

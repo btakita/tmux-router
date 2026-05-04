@@ -18,8 +18,9 @@
 //! - `new_session(name, cwd)` — creates a detached session and returns its first pane ID.
 //! - `new_window(session, cwd)` — creates a new window in an existing session and
 //!   returns the pane ID; uses `session:` target syntax to avoid numeric-name ambiguity.
-//! - `send_keys(pane_id, text)` — sends text literally (`-l`) then `Enter` as a
-//!   separate call with a 100 ms delay between them for TUI compatibility.
+//! - `send_keys(pane_id, text)` — sends text literally (`-l`) and an `Enter`
+//!   submit inside one tmux batch invocation so managed TUIs avoid
+//!   split-process text/Enter races.
 //! - `send_key(pane_id, key)` — sends a single tmux key name (for example `Enter`,
 //!   `Up`, `Escape`) without enabling literal mode.
 //! - `send_keys_raw(pane_id, keys)` — sends keystrokes without literal mode or Enter,
@@ -275,34 +276,16 @@ impl Tmux {
     /// Send keys to a tmux pane.
     ///
     /// Uses `-l` for literal text (no special key interpretation), then sends
-    /// Enter separately. A small delay between text and Enter ensures the TUI
-    /// (e.g., Claude Code) processes the input before the submit.
+    /// `Enter` inside the same tmux invocation so managed TUIs avoid a racy
+    /// text-then-Enter split.
     pub fn send_keys(&self, pane_id: &str, text: &str) -> Result<()> {
-        // Send text + Enter in a single tmux command to avoid timing issues.
-        // Using two separate args: first the literal text (-l), then Enter as
-        // a separate non-literal key. tmux processes them atomically in one call.
-        let status = self
-            .cmd()
-            .args(["send-keys", "-t", pane_id, "-l", text])
-            .status()
-            .context("failed to run tmux send-keys (text)")?;
-        if !status.success() {
-            anyhow::bail!("tmux send-keys failed (text)");
+        let commands = send_keys_batch_commands(pane_id, text);
+        let mut batch = TmuxBatch::new(self);
+        for command in &commands {
+            let refs: Vec<&str> = command.iter().map(String::as_str).collect();
+            batch.add(&refs);
         }
-
-        // Brief pause for TUI to process literal text before Enter.
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Send Enter separately
-        let status = self
-            .cmd()
-            .args(["send-keys", "-t", pane_id, "Enter"])
-            .status()
-            .context("failed to run tmux send-keys (enter)")?;
-        if !status.success() {
-            anyhow::bail!("tmux send-keys failed (enter)");
-        }
-        Ok(())
+        batch.execute()
     }
 
     /// Send a single tmux key name to a pane without literal mode.
@@ -1113,6 +1096,24 @@ impl Tmux {
     }
 }
 
+fn send_keys_batch_commands(pane_id: &str, text: &str) -> [Vec<String>; 2] {
+    [
+        vec![
+            "send-keys".into(),
+            "-t".into(),
+            pane_id.into(),
+            "-l".into(),
+            text.into(),
+        ],
+        vec![
+            "send-keys".into(),
+            "-t".into(),
+            pane_id.into(),
+            "Enter".into(),
+        ],
+    ]
+}
+
 /// RAII guard that kills the isolated tmux server on drop.
 pub struct IsolatedTmux {
     tmux: Tmux,
@@ -1319,6 +1320,28 @@ mod tmux_tests {
         assert!(
             content.contains("hello"),
             "pane should contain submitted input after send_key Enter: {content}"
+        );
+    }
+
+    #[test]
+    fn send_keys_batch_commands_keep_submit_in_same_tmux_invocation() {
+        assert_eq!(
+            send_keys_batch_commands("%7", "agent-doc tasks/agent-doc/agent-doc-bugs2.md"),
+            [
+                vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    "%7".to_string(),
+                    "-l".to_string(),
+                    "agent-doc tasks/agent-doc/agent-doc-bugs2.md".to_string(),
+                ],
+                vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    "%7".to_string(),
+                    "Enter".to_string(),
+                ],
+            ]
         );
     }
 

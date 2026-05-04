@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Literal submit writes now stay in one tmux invocation for managed TUI panes.** `Tmux::send_keys()` no longer shells out twice for literal text and a later `Enter` keypress. It now batches the literal payload and the `Enter` submit into one tmux invocation, which removes the cross-process timing gap that could leave Codex/Claude-style managed panes with a drafted command instead of a submitted reopen. Added a regression that locks the batched command shape.
 - **Callers can now block ephemeral donor/spare-pane assignment for specific unresolved files.** `SyncOptions` now exposes an `allow_unresolved_pane_assignment` callback, and `sync` skips both same-column donor reuse and target-window spare-pane reuse when the caller rejects a file. This lets higher-level tools fail closed for managed-but-unresolved documents instead of silently aliasing another live pane into that column. Added a regression that blocks spare-pane reuse for a missing left-column file.
 - **Session/key primitives extracted from agent-doc.** `Tmux` now owns `send_key()` and `ensure_pane_in_session()`, so sibling projects can reuse single-key dispatch and fail-closed session checks without shelling out for their own wrappers.
 

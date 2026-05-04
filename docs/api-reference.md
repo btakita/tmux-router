@@ -15,7 +15,7 @@ Tmux server handle. Supports both the default server and isolated test servers.
 | `session_exists(name)` | Check if named session exists |
 | `new_session(name, cwd)` | Create session, return pane ID |
 | `new_window(session, cwd)` | Create window, return pane ID |
-| `send_keys(pane, text)` | Send literal text + Enter |
+| `send_keys(pane, text)` | Send literal text plus `Enter` in one tmux invocation |
 | `select_pane(pane)` | Focus a pane |
 | `join_pane(src, dst, flag)` | Move pane to another window |
 | `break_pane(pane)` | Break pane into new window |
