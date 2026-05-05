@@ -19,8 +19,8 @@
 //! - `new_window(session, cwd)` — creates a new window in an existing session and
 //!   returns the pane ID; uses `session:` target syntax to avoid numeric-name ambiguity.
 //! - `send_keys(pane_id, text)` — sends one submitted command to a pane by
-//!   batching literal text (`-l`) plus a named `Enter` key in one tmux
-//!   invocation.
+//!   sending literal text (`-l`), waiting briefly, then sending a named
+//!   `Enter` key.
 //! - `send_key(pane_id, key)` — sends a single tmux key name (for example `Enter`,
 //!   `Up`, `Escape`) without enabling literal mode.
 //! - `send_keys_raw(pane_id, keys)` — sends keystrokes without literal mode or Enter,
@@ -103,8 +103,10 @@
 //!   without "index 0 in use" error.
 //! - `send_keys_literal`: text containing tmux special chars (e.g. `q`, `C-c`) is sent
 //!   as-is and not interpreted as key sequences.
-//! - `send_keys_ascii_batch_submit`: ASCII text is sent as literal text plus a
-//!   named `Enter` key in one tmux batch invocation.
+//! - `send_keys_ascii_delayed_submit`: ASCII text is sent as literal text,
+//!   then a short delay is inserted before the submit `Enter` key so managed
+//!   TUIs like Codex treat the key as a real submit instead of leaving the
+//!   command drafted in the composer.
 //! - `auto_start_creates_session`: with no server running, `auto_start` creates a session
 //!   and returns a non-empty pane ID.
 //! - `auto_start_creates_window`: with an existing session, `auto_start` adds a window
@@ -124,6 +126,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+const SEND_KEYS_SUBMIT_DELAY: Duration = Duration::from_millis(50);
 
 /// Tmux server handle — supports isolated `-L` servers for testing.
 #[derive(Debug, Clone, Default)]
@@ -281,15 +286,21 @@ impl Tmux {
     /// Send keys to a tmux pane.
     ///
     /// Normalizes away trailing line endings in `text`, then appends exactly
-    /// one submit keystroke by batching literal text plus a named `Enter`.
+    /// one submit keystroke after a short delay. Codex's composer can leave the
+    /// command drafted when the literal text and `Enter` arrive in the same
+    /// tmux tick, so the delay is part of the canonical submit contract.
     pub fn send_keys(&self, pane_id: &str, text: &str) -> Result<()> {
-        let mut batch = TmuxBatch::new(self);
-        let commands = send_keys_batch_commands(pane_id, text);
-        for command in &commands {
-            let refs: Vec<&str> = command.iter().map(String::as_str).collect();
-            batch.add(&refs);
+        let text = normalize_send_keys_text(text);
+        let status = self
+            .cmd()
+            .args(["send-keys", "-t", pane_id, "-l", text])
+            .status()
+            .context("failed to run tmux send-keys (literal)")?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys failed for pane {}", pane_id);
         }
-        batch.execute()
+        std::thread::sleep(SEND_KEYS_SUBMIT_DELAY);
+        self.send_key(pane_id, "Enter")
     }
 
     /// Send a single tmux key name to a pane without literal mode.
@@ -1104,7 +1115,8 @@ fn normalize_send_keys_text(text: &str) -> &str {
     text.trim_end_matches(['\r', '\n'])
 }
 
-fn send_keys_batch_commands(pane_id: &str, text: &str) -> [Vec<String>; 2] {
+#[cfg(test)]
+fn send_keys_delayed_submit_commands(pane_id: &str, text: &str) -> [Vec<String>; 2] {
     let text = normalize_send_keys_text(text);
     [
         vec![
@@ -1333,9 +1345,9 @@ mod tmux_tests {
     }
 
     #[test]
-    fn send_keys_batch_commands_keep_submit_in_same_tmux_invocation() {
+    fn send_keys_delayed_submit_commands_keep_submit_shape_stable() {
         assert_eq!(
-            send_keys_batch_commands("%7", "agent-doc tasks/agent-doc/agent-doc-bugs2.md"),
+            send_keys_delayed_submit_commands("%7", "agent-doc tasks/agent-doc/agent-doc-bugs2.md"),
             [
                 vec![
                     "send-keys".to_string(),
@@ -1357,7 +1369,7 @@ mod tmux_tests {
     #[test]
     fn send_keys_paths_trim_trailing_line_endings_before_submit() {
         assert_eq!(
-            send_keys_batch_commands("%9", "/clear\r\n"),
+            send_keys_delayed_submit_commands("%9", "/clear\r\n"),
             [
                 vec![
                     "send-keys".to_string(),
@@ -1375,7 +1387,7 @@ mod tmux_tests {
             ]
         );
         assert_eq!(
-            send_keys_batch_commands("%9", "café\n"),
+            send_keys_delayed_submit_commands("%9", "café\n"),
             [
                 vec![
                     "send-keys".to_string(),
@@ -1392,6 +1404,87 @@ mod tmux_tests {
                 ],
             ]
         );
+    }
+
+    #[test]
+    fn send_keys_submit_delay_is_long_enough_for_managed_tuis() {
+        assert_eq!(SEND_KEYS_SUBMIT_DELAY, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn send_keys_waits_before_submit_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let iso = IsolatedTmux::new("tmux-send-keys-submit-delay");
+        let pane = iso.new_session("sess-delay", Path::new("/tmp")).unwrap();
+        let script = std::env::temp_dir().join(format!(
+            "tmux-send-keys-delay-{}-{}.py",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("anon")
+        ));
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import os
+import sys
+import termios
+import time
+import tty
+
+fd = sys.stdin.fileno()
+saved = termios.tcgetattr(fd)
+try:
+    tty.setraw(fd)
+    os.write(sys.stdout.fileno(), b"READY\n")
+    buf = bytearray()
+    last_char_ms = 0
+    while True:
+        ch = os.read(fd, 1)
+        if not ch:
+            break
+        now = time.monotonic_ns() // 1_000_000
+        if ch in (b"\r", b"\n"):
+            if not buf:
+                continue
+            delta = now - last_char_ms
+            prefix = b"SUBMITTED:" if delta >= 40 else b"DRAFT:"
+            os.write(sys.stdout.fileno(), prefix + bytes(buf) + b"\n")
+            break
+        buf.extend(ch)
+        last_char_ms = now
+finally:
+    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        iso.send_keys(&pane, &format!("exec {}", script.display()))
+            .unwrap();
+        assert!(
+            wait_for(Duration::from_secs(3), || {
+                iso.capture_pane(&pane, Some(20))
+                    .map(|content| content.contains("READY"))
+                    .unwrap_or(false)
+            }),
+            "mock TUI did not become ready"
+        );
+        iso.send_keys(&pane, "/clear").unwrap();
+        assert!(
+            wait_for(Duration::from_secs(3), || {
+                iso.capture_pane(&pane, Some(20))
+                    .map(|content| content.contains("SUBMITTED:/clear"))
+                    .unwrap_or(false)
+            }),
+            "delayed submit should be observed as a submitted command"
+        );
+        let content = iso.capture_pane(&pane, Some(20)).unwrap();
+        assert!(
+            !content.contains("DRAFT:/clear"),
+            "submit helper should not leave the command drafted: {content}"
+        );
+        let _ = std::fs::remove_file(&script);
     }
 
     #[test]
