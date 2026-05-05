@@ -18,10 +18,9 @@
 //! - `new_session(name, cwd)` — creates a detached session and returns its first pane ID.
 //! - `new_window(session, cwd)` — creates a new window in an existing session and
 //!   returns the pane ID; uses `session:` target syntax to avoid numeric-name ambiguity.
-//! - `send_keys(pane_id, text)` — sends one submitted command to a pane. For
-//!   ASCII payloads it emits the text bytes plus a trailing carriage return in
-//!   one `send-keys -H` tmux command; non-ASCII payloads fall back to literal
-//!   text (`-l`) plus `Enter` in one tmux batch invocation.
+//! - `send_keys(pane_id, text)` — sends one submitted command to a pane by
+//!   batching literal text (`-l`) plus a named `Enter` key in one tmux
+//!   invocation.
 //! - `send_key(pane_id, key)` — sends a single tmux key name (for example `Enter`,
 //!   `Up`, `Escape`) without enabling literal mode.
 //! - `send_keys_raw(pane_id, keys)` — sends keystrokes without literal mode or Enter,
@@ -104,8 +103,8 @@
 //!   without "index 0 in use" error.
 //! - `send_keys_literal`: text containing tmux special chars (e.g. `q`, `C-c`) is sent
 //!   as-is and not interpreted as key sequences.
-//! - `send_keys_ascii_single_command`: ASCII text is encoded as one `send-keys -H`
-//!   command ending with `0d` so managed TUIs receive one byte stream plus Enter.
+//! - `send_keys_ascii_batch_submit`: ASCII text is sent as literal text plus a
+//!   named `Enter` key in one tmux batch invocation.
 //! - `auto_start_creates_session`: with no server running, `auto_start` creates a session
 //!   and returns a non-empty pane ID.
 //! - `auto_start_creates_window`: with an existing session, `auto_start` adds a window
@@ -282,20 +281,13 @@ impl Tmux {
     /// Send keys to a tmux pane.
     ///
     /// Normalizes away trailing line endings in `text`, then appends exactly
-    /// one submit keystroke. ASCII payloads use a single `send-keys -H`
-    /// command so tmux sends the full byte stream and carriage return as one
-    /// unit; non-ASCII payloads fall back to literal text plus `Enter`.
+    /// one submit keystroke by batching literal text plus a named `Enter`.
     pub fn send_keys(&self, pane_id: &str, text: &str) -> Result<()> {
         let mut batch = TmuxBatch::new(self);
-        if let Some(command) = send_keys_hex_command(pane_id, text) {
+        let commands = send_keys_batch_commands(pane_id, text);
+        for command in &commands {
             let refs: Vec<&str> = command.iter().map(String::as_str).collect();
             batch.add(&refs);
-        } else {
-            let commands = send_keys_batch_commands(pane_id, text);
-            for command in &commands {
-                let refs: Vec<&str> = command.iter().map(String::as_str).collect();
-                batch.add(&refs);
-            }
         }
         batch.execute()
     }
@@ -1112,25 +1104,6 @@ fn normalize_send_keys_text(text: &str) -> &str {
     text.trim_end_matches(['\r', '\n'])
 }
 
-fn send_keys_hex_command(pane_id: &str, text: &str) -> Option<Vec<String>> {
-    let text = normalize_send_keys_text(text);
-    if !text.is_ascii() {
-        return None;
-    }
-
-    let mut command = vec![
-        "send-keys".into(),
-        "-t".into(),
-        pane_id.into(),
-        "-H".into(),
-    ];
-    for byte in text.bytes() {
-        command.push(format!("{byte:02x}"));
-    }
-    command.push("0d".into());
-    Some(command)
-}
-
 fn send_keys_batch_commands(pane_id: &str, text: &str) -> [Vec<String>; 2] {
     let text = normalize_send_keys_text(text);
     [
@@ -1382,80 +1355,24 @@ mod tmux_tests {
     }
 
     #[test]
-    fn send_keys_hex_command_uses_single_ascii_stream_with_carriage_return_submit() {
-        assert_eq!(
-            send_keys_hex_command("%7", "agent-doc tasks/agent-doc/agent-doc-bugs2.md"),
-            Some(vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                "%7".to_string(),
-                "-H".to_string(),
-                "61".to_string(),
-                "67".to_string(),
-                "65".to_string(),
-                "6e".to_string(),
-                "74".to_string(),
-                "2d".to_string(),
-                "64".to_string(),
-                "6f".to_string(),
-                "63".to_string(),
-                "20".to_string(),
-                "74".to_string(),
-                "61".to_string(),
-                "73".to_string(),
-                "6b".to_string(),
-                "73".to_string(),
-                "2f".to_string(),
-                "61".to_string(),
-                "67".to_string(),
-                "65".to_string(),
-                "6e".to_string(),
-                "74".to_string(),
-                "2d".to_string(),
-                "64".to_string(),
-                "6f".to_string(),
-                "63".to_string(),
-                "2f".to_string(),
-                "61".to_string(),
-                "67".to_string(),
-                "65".to_string(),
-                "6e".to_string(),
-                "74".to_string(),
-                "2d".to_string(),
-                "64".to_string(),
-                "6f".to_string(),
-                "63".to_string(),
-                "2d".to_string(),
-                "62".to_string(),
-                "75".to_string(),
-                "67".to_string(),
-                "73".to_string(),
-                "32".to_string(),
-                "2e".to_string(),
-                "6d".to_string(),
-                "64".to_string(),
-                "0d".to_string(),
-            ])
-        );
-    }
-
-    #[test]
     fn send_keys_paths_trim_trailing_line_endings_before_submit() {
         assert_eq!(
-            send_keys_hex_command("%9", "/clear\r\n"),
-            Some(vec![
-                "send-keys".to_string(),
-                "-t".to_string(),
-                "%9".to_string(),
-                "-H".to_string(),
-                "2f".to_string(),
-                "63".to_string(),
-                "6c".to_string(),
-                "65".to_string(),
-                "61".to_string(),
-                "72".to_string(),
-                "0d".to_string(),
-            ])
+            send_keys_batch_commands("%9", "/clear\r\n"),
+            [
+                vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    "%9".to_string(),
+                    "-l".to_string(),
+                    "/clear".to_string(),
+                ],
+                vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    "%9".to_string(),
+                    "Enter".to_string(),
+                ],
+            ]
         );
         assert_eq!(
             send_keys_batch_commands("%9", "café\n"),
