@@ -28,7 +28,8 @@ RAII guard for test servers. Creates an isolated tmux via `-L`, kills on drop.
 
 ### `RegistryEntry`
 
-A single registry entry with fields: `pane`, `pid`, `cwd`, `started`, `file`, `window`.
+A single registry entry with fields: `pane`, `pid`, `cwd`, `started`,
+`session_id`, `file`, `window`, `supervisor_instance_id`.
 
 ### `Registry`
 

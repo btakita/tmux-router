@@ -339,6 +339,56 @@ mod tests {
     }
 
     #[test]
+    fn registry_entry_round_trips_session_and_supervisor_fields() {
+        let (_dir, reg_path) = setup();
+        let mut registry = Registry::new();
+        registry.insert(
+            "test-key".to_string(),
+            RegistryEntry {
+                pane: "%7".to_string(),
+                pid: 4321,
+                cwd: "/workspace".to_string(),
+                started: "2026-05-07T00:00:00Z".to_string(),
+                session_id: "session-7".to_string(),
+                file: "tasks/software/tmux-router.md".to_string(),
+                window: "@3".to_string(),
+                supervisor_instance_id: "supervisor-7".to_string(),
+            },
+        );
+
+        save_registry(&reg_path, &registry).unwrap();
+
+        let loaded = load_registry(&reg_path).unwrap();
+        let entry = loaded.get("test-key").unwrap();
+        assert_eq!(entry.session_id, "session-7");
+        assert_eq!(entry.supervisor_instance_id, "supervisor-7");
+    }
+
+    #[test]
+    fn registry_entry_defaults_session_and_supervisor_fields_for_legacy_json() {
+        let (_dir, reg_path) = setup();
+        std::fs::write(
+            &reg_path,
+            r#"{
+  "legacy-key": {
+    "pane": "%1",
+    "pid": 1234,
+    "cwd": "/tmp",
+    "started": "2026-01-01T00:00:00Z",
+    "file": "legacy.md",
+    "window": "@1"
+  }
+}"#,
+        )
+        .unwrap();
+
+        let loaded = load_registry(&reg_path).unwrap();
+        let entry = loaded.get("legacy-key").unwrap();
+        assert_eq!(entry.session_id, "");
+        assert_eq!(entry.supervisor_instance_id, "");
+    }
+
+    #[test]
     fn with_registry_val_returns_value() {
         let (_dir, reg_path) = setup();
         save_registry(&reg_path, &Registry::new()).unwrap();

@@ -12,8 +12,10 @@ Each entry tracks:
 | `pid` | u32 | Foreground process PID |
 | `cwd` | String | Working directory at registration |
 | `started` | String | UTC timestamp |
+| `session_id` | String | Document session UUID; defaults to empty for legacy entries |
 | `file` | String | Associated file path |
 | `window` | String | Tmux window ID (e.g. `@5`) |
+| `supervisor_instance_id` | String | Stable long-lived supervisor identity; defaults to empty for legacy entries |
 
 ## Operations
 
