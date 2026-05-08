@@ -438,9 +438,9 @@ pub struct SyncResult {
 
 /// Options for sync behavior customization.
 pub struct SyncOptions<'a> {
-    /// Callback to check if a pane should be protected from stashing.
+    /// Callback to check if a pane should be protected from stashing or swap-out.
     /// Returns `true` if the pane is busy (e.g., running an active agent session)
-    /// and should NOT be stashed during the DETACH phase.
+    /// and should NOT be displaced during SWAP or DETACH.
     /// When `None`, all unwanted panes are eligible for stashing.
     pub protect_pane: Option<&'a dyn Fn(&str) -> bool>,
     /// Callback to decide whether an unresolved managed file may borrow a
@@ -1048,32 +1048,44 @@ pub fn reconcile(
         let incoming = to_attach[0];
         let outgoing = to_detach[0];
 
-        // Only swap if the incoming pane is alive and SessionScope allows it
-        if tmux.pane_window(incoming).is_ok() {
-            match scope.swap_pane(incoming, outgoing, &mut log) {
-                Ok(true) => {
-                    log.log("SWAP", format!("{} ↔ {} (atomic)", incoming, outgoing));
-                    update_registry(tmux, incoming, registry_path, &mut log);
-                    update_registry(tmux, outgoing, registry_path, &mut log);
+        if options
+            .protect_pane
+            .map(|protect| protect(outgoing))
+            .unwrap_or(false)
+        {
+            log.log(
+                "SWAP",
+                format!("skipped {} — protected (busy pane)", outgoing),
+            );
+        } else {
 
-                    let select_target = focus_pane.unwrap_or(first_pane);
-                    let _ = tmux.select_pane(select_target);
-                    log.log("SELECT", format!("focused {}", select_target));
+            // Only swap if the incoming pane is alive and SessionScope allows it
+            if tmux.pane_window(incoming).is_ok() {
+                match scope.swap_pane(incoming, outgoing, &mut log) {
+                    Ok(true) => {
+                        log.log("SWAP", format!("{} ↔ {} (atomic)", incoming, outgoing));
+                        update_registry(tmux, incoming, registry_path, &mut log);
+                        update_registry(tmux, outgoing, registry_path, &mut log);
 
-                    return Ok(log);
-                }
-                Ok(false) => {
-                    // Scope blocked the swap — fall through to ATTACH/DETACH
-                }
-                Err(e) => {
-                    log.log_err(
-                        "SWAP",
-                        format!(
-                            "swap-pane failed ({} ↔ {}): {}, falling back to join+stash",
-                            incoming, outgoing, e
-                        ),
-                    );
-                    // Fall through to normal ATTACH/DETACH
+                        let select_target = focus_pane.unwrap_or(first_pane);
+                        let _ = tmux.select_pane(select_target);
+                        log.log("SELECT", format!("focused {}", select_target));
+
+                        return Ok(log);
+                    }
+                    Ok(false) => {
+                        // Scope blocked the swap — fall through to ATTACH/DETACH
+                    }
+                    Err(e) => {
+                        log.log_err(
+                            "SWAP",
+                            format!(
+                                "swap-pane failed ({} ↔ {}): {}, falling back to join+stash",
+                                incoming, outgoing, e
+                            ),
+                        );
+                        // Fall through to normal ATTACH/DETACH
+                    }
                 }
             }
         }
@@ -1303,13 +1315,39 @@ pub fn reconcile(
     if final_refs == desired_ordered {
         log.log("VERIFY", "layout correct");
     } else {
-        log.log_err(
-            "VERIFY",
-            format!(
-                "mismatch — desired={:?}, actual={:?}",
-                desired_ordered, final_refs
-            ),
-        );
+        let protected_extras: HashSet<&str> = final_refs
+            .iter()
+            .copied()
+            .filter(|pane| !wanted.contains(pane))
+            .filter(|pane| {
+                options
+                    .protect_pane
+                    .map(|protect| protect(pane))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let filtered_final: Vec<&str> = final_refs
+            .iter()
+            .copied()
+            .filter(|pane| wanted.contains(pane) || !protected_extras.contains(pane))
+            .collect();
+        if filtered_final == desired_ordered {
+            log.log(
+                "VERIFY",
+                format!(
+                    "layout correct with protected extra pane(s): {:?}",
+                    protected_extras
+                ),
+            );
+        } else {
+            log.log_err(
+                "VERIFY",
+                format!(
+                    "mismatch — desired={:?}, actual={:?}",
+                    desired_ordered, final_refs
+                ),
+            );
+        }
     }
 
     // --- POST-CONDITION: session boundary invariant ---
