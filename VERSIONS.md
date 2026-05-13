@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **OpenCode submit can use Kitty keyboard Return.** `Tmux::send_keys_with_kitty_return()` sends the literal payload, waits for the canonical submit delay, then emits the Kitty keyboard `Return` sequence as literal bytes. This lets OpenCode callers avoid panes that interpret bare tmux `Enter` as `ctrl+j` newline input.
 - **RegistryEntry docs/tests now lock the current supervisor fields.** The API
   and registry docs now list `session_id` and `supervisor_instance_id`, and
   registry tests cover both modern round-trip serialization and legacy JSON

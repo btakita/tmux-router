@@ -129,6 +129,7 @@ use std::process::Command;
 use std::time::Duration;
 
 const SEND_KEYS_SUBMIT_DELAY: Duration = Duration::from_millis(50);
+const KITTY_RETURN_SEQUENCE: &str = "\x1b[13u";
 
 /// Tmux server handle — supports isolated `-L` servers for testing.
 #[derive(Debug, Clone, Default)]
@@ -301,6 +302,33 @@ impl Tmux {
         }
         std::thread::sleep(SEND_KEYS_SUBMIT_DELAY);
         self.send_key(pane_id, "Enter")
+    }
+
+    /// Send literal text, then submit with Kitty keyboard protocol Return.
+    ///
+    /// OpenCode can distinguish `return` from `ctrl+j` through enhanced
+    /// keyboard sequences. A plain tmux `Enter` injects a carriage return,
+    /// which some OpenCode panes treat as newline input instead of submit.
+    pub fn send_keys_with_kitty_return(&self, pane_id: &str, text: &str) -> Result<()> {
+        let text = normalize_send_keys_text(text);
+        let status = self
+            .cmd()
+            .args(["send-keys", "-t", pane_id, "-l", text])
+            .status()
+            .context("failed to run tmux send-keys (literal)")?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys failed for pane {}", pane_id);
+        }
+        std::thread::sleep(SEND_KEYS_SUBMIT_DELAY);
+        let status = self
+            .cmd()
+            .args(["send-keys", "-t", pane_id, "-l", KITTY_RETURN_SEQUENCE])
+            .status()
+            .context("failed to run tmux send-keys (kitty return)")?;
+        if !status.success() {
+            anyhow::bail!("tmux send-keys kitty return failed for pane {}", pane_id);
+        }
+        Ok(())
     }
 
     /// Send a single tmux key name to a pane without literal mode.
@@ -1135,6 +1163,27 @@ fn send_keys_delayed_submit_commands(pane_id: &str, text: &str) -> [Vec<String>;
     ]
 }
 
+#[cfg(test)]
+fn send_keys_kitty_return_submit_commands(pane_id: &str, text: &str) -> [Vec<String>; 2] {
+    let text = normalize_send_keys_text(text);
+    [
+        vec![
+            "send-keys".into(),
+            "-t".into(),
+            pane_id.into(),
+            "-l".into(),
+            text.into(),
+        ],
+        vec![
+            "send-keys".into(),
+            "-t".into(),
+            pane_id.into(),
+            "-l".into(),
+            KITTY_RETURN_SEQUENCE.into(),
+        ],
+    ]
+}
+
 /// RAII guard that kills the isolated tmux server on drop.
 pub struct IsolatedTmux {
     tmux: Tmux,
@@ -1409,6 +1458,29 @@ mod tmux_tests {
     #[test]
     fn send_keys_submit_delay_is_long_enough_for_managed_tuis() {
         assert_eq!(SEND_KEYS_SUBMIT_DELAY, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn send_keys_kitty_return_uses_enhanced_return_sequence() {
+        assert_eq!(
+            send_keys_kitty_return_submit_commands("%9", "agent-doc plan.md\n"),
+            [
+                vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    "%9".to_string(),
+                    "-l".to_string(),
+                    "agent-doc plan.md".to_string(),
+                ],
+                vec![
+                    "send-keys".to_string(),
+                    "-t".to_string(),
+                    "%9".to_string(),
+                    "-l".to_string(),
+                    "\x1b[13u".to_string(),
+                ],
+            ]
+        );
     }
 
     #[test]
