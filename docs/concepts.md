@@ -24,6 +24,20 @@ starts a long-lived `tmux -C` client and parses its event lines into
 state can wait for `%output`, `%pane-died`, `%pane-exited`, and related
 notifications instead of sleeping and polling `capture-pane`.
 
+## Hybrid Pane Policy
+
+The hybrid pane policy keeps tmux as the visible multiplexer while assigning
+each responsibility to the least lossy backend:
+
+- lifecycle/events: control mode;
+- live output capture: `pipe-pane` when a durable stream sink is needed;
+- input: tmux submit fallbacks for visible panes, with owned PTY input reserved
+  for managed Claude/OpenCode supervisors where byte-exact delivery matters.
+
+`strategy_for_harness()` exposes that policy, and `submit_text_for_harness()`
+centralizes the tmux fallback submit behavior so OpenCode's Kitty Return path
+does not drift from other tmux-backed submitters.
+
 ## Registry
 
 Persistent key-to-pane mappings stored as JSON. See [Registry](./registry.md).

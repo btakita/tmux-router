@@ -437,6 +437,7 @@ pub struct SyncResult {
 }
 
 /// Options for sync behavior customization.
+#[derive(Default)]
 pub struct SyncOptions<'a> {
     /// Callback to check if a pane should be protected from stashing or swap-out.
     /// Returns `true` if the pane is busy (e.g., running an active agent session)
@@ -448,15 +449,6 @@ pub struct SyncOptions<'a> {
     /// Returns `true` to allow ephemeral assignment, `false` to keep the file
     /// unresolved for this sync cycle.
     pub allow_unresolved_pane_assignment: Option<&'a dyn Fn(&Path) -> bool>,
-}
-
-impl<'a> Default for SyncOptions<'a> {
-    fn default() -> Self {
-        Self {
-            protect_pane: None,
-            allow_unresolved_pane_assignment: None,
-        }
-    }
 }
 
 /// Sync editor layout to tmux panes.
@@ -757,11 +749,11 @@ pub fn sync_with_options(
                     );
                     break;
                 }
-                if let Some(ref protect) = options.protect_pane {
-                    if protect(pane) {
-                        eprintln!("[sync] skipped stashing {} — protected (busy pane)", pane);
-                        continue;
-                    }
+                if let Some(ref protect) = options.protect_pane
+                    && protect(pane)
+                {
+                    eprintln!("[sync] skipped stashing {} — protected (busy pane)", pane);
+                    continue;
                 }
                 let _ = tmux.stash_pane(pane, &s);
             }
@@ -991,6 +983,7 @@ pub fn sync_with_options(
 /// By attaching BEFORE detaching, the focus pane is in the window when
 /// unwanted panes are stashed, preventing tmux from auto-selecting a
 /// different pane.
+#[allow(clippy::too_many_arguments)]
 pub fn reconcile(
     tmux: &Tmux,
     target_window: &str,
@@ -1189,14 +1182,14 @@ pub fn reconcile(
             continue;
         }
         // Busy pane check: skip if caller says this pane is protected
-        if let Some(ref protect) = options.protect_pane {
-            if protect(pane) {
-                log.log(
-                    "DETACH",
-                    format!("skipped {} — protected (busy pane)", pane),
-                );
-                continue;
-            }
+        if let Some(ref protect) = options.protect_pane
+            && protect(pane)
+        {
+            log.log(
+                "DETACH",
+                format!("skipped {} — protected (busy pane)", pane),
+            );
+            continue;
         }
         // Cross-session check: skip if pane is registered to another session
         if let Some(sess) = session_name

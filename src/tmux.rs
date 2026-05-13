@@ -57,6 +57,9 @@
 //! - `capture_pane(pane_id, lines)` — captures visible content or N scrollback lines.
 //! - `attach_control_mode(target)` — starts one long-lived control-mode client
 //!   that emits pane output and lifecycle events without capture-pane polling.
+//! - `start_pipe_pane_to_file(pane_id, path, append)` — starts `pipe-pane`
+//!   live output streaming and returns an RAII guard that disables the pipe on
+//!   drop.
 //! - `enable_remain_on_exit(pane_id)` — enables pane-local `remain-on-exit on` so
 //!   dead panes remain inspectable even after stash/rescue window moves.
 //! - `pane_dead_status(pane_id)` — returns tmux's retained dead-pane exit status when
@@ -126,6 +129,8 @@
 //!   pane IDs, and running commands in a nested indented structure.
 //! - `control_mode_receives_pane_output_without_capture_polling`: a control-mode
 //!   reader attached to an isolated tmux session observes pane output via events.
+//! - `pipe_pane_streams_output_without_capture_polling`: `pipe-pane` streams
+//!   future pane output into a file without using `capture-pane`.
 
 use anyhow::{Context, Result};
 use std::path::Path;
