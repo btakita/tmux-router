@@ -77,6 +77,15 @@ enum Command {
         #[arg(long)]
         lines: Option<u32>,
     },
+    /// Stream tmux control-mode events.
+    Events {
+        /// Tmux session/window target to attach, for example a session name.
+        #[arg(long)]
+        target: Option<String>,
+        /// Stop after this many events. Omit to stream until interrupted.
+        #[arg(long)]
+        max_events: Option<usize>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -194,6 +203,21 @@ fn main() -> Result<()> {
             let pane = resolve_target(&cli.registry, &target)?;
             let content = tmux.capture_pane(&pane, lines)?;
             print!("{}", content);
+        }
+        Command::Events { target, max_events } => {
+            let control = tmux.attach_control_mode(target.as_deref())?;
+            let mut seen = 0usize;
+            loop {
+                let Some(event) = control.next_event_timeout(std::time::Duration::from_secs(60))?
+                else {
+                    continue;
+                };
+                println!("{event}");
+                seen += 1;
+                if max_events.is_some_and(|max| seen >= max) {
+                    break;
+                }
+            }
         }
     }
     Ok(())

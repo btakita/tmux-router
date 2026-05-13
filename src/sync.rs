@@ -1058,7 +1058,6 @@ pub fn reconcile(
                 format!("skipped {} — protected (busy pane)", outgoing),
             );
         } else {
-
             // Only swap if the incoming pane is alive and SessionScope allows it
             if tmux.pane_window(incoming).is_ok() {
                 match scope.swap_pane(incoming, outgoing, &mut log) {

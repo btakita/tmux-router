@@ -55,6 +55,8 @@
 //! - `auto_start(session, cwd)` — creates a session if the server or session is absent,
 //!   otherwise creates a new window; returns the new pane ID.
 //! - `capture_pane(pane_id, lines)` — captures visible content or N scrollback lines.
+//! - `attach_control_mode(target)` — starts one long-lived control-mode client
+//!   that emits pane output and lifecycle events without capture-pane polling.
 //! - `enable_remain_on_exit(pane_id)` — enables pane-local `remain-on-exit on` so
 //!   dead panes remain inspectable even after stash/rescue window moves.
 //! - `pane_dead_status(pane_id)` — returns tmux's retained dead-pane exit status when
@@ -122,6 +124,8 @@
 //!   appear earlier in the result of `list_panes_ordered`.
 //! - `dump_tmux_tree_format`: output contains session name, attach state, window name,
 //!   pane IDs, and running commands in a nested indented structure.
+//! - `control_mode_receives_pane_output_without_capture_polling`: a control-mode
+//!   reader attached to an isolated tmux session observes pane output via events.
 
 use anyhow::{Context, Result};
 use std::path::Path;

@@ -50,6 +50,10 @@ tmux-router send %5 "C-c" --raw
 # Capture pane screen content
 tmux-router capture src/main.rs
 tmux-router capture %5 --lines 50
+
+# Stream pane output and lifecycle notifications without capture-pane polling
+tmux-router events --target my-session
+tmux-router events --target my-session --max-events 20
 ```
 
 ## Use Cases
@@ -126,6 +130,13 @@ if echo "$result" | grep -q "ok"; then
 fi
 ```
 
+### Event-Driven Pane Monitoring
+
+Use `events` or `Tmux::attach_control_mode()` when a workflow needs live pane
+output or lifecycle notifications. This opens one `tmux -C` client and reads
+`%output`, `%pane-died`, `%pane-exited`, and other control-mode notifications
+as they happen, instead of repeatedly polling `capture-pane`.
+
 ## Library Usage
 
 ```rust
@@ -156,6 +167,14 @@ let output = tmux.capture_pane("%5", Some(20))?;
 
 // Send raw tmux keys
 tmux.send_keys_raw("%5", "C-c")?;
+
+// Stream output from a control-mode client
+let control = tmux.attach_control_mode(Some("my-session"))?;
+let output = control.wait_for_pane_output(
+    "%5",
+    std::time::Duration::from_secs(5),
+    |bytes| String::from_utf8_lossy(bytes).contains("ready"),
+)?;
 ```
 
 ## Architecture
@@ -164,6 +183,7 @@ tmux.send_keys_raw("%5", "C-c")?;
 - **Layout reconciliation** — attach-first algorithm (ATTACH → SELECT → DETACH → REORDER → VERIFY)
 - **Stash window** — evicted panes collected in one place, not scattered; early-exit paths stash excess panes to prevent leftovers from previous layouts
 - **Health management** — dead panes pruned, stale bindings cleaned up
+- **Control-mode events** — long-lived `tmux -C` readers expose pane output and lifecycle notifications for event-driven monitors
 
 ## License
 

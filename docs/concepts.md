@@ -16,6 +16,14 @@ let tmux = Tmux::default_server();
 assert!(tmux.pane_alive("%0"));
 ```
 
+## Control Mode
+
+Control mode is the streaming side of the tmux wrapper. `Tmux::attach_control_mode()`
+starts a long-lived `tmux -C` client and parses its event lines into
+`TmuxControlEvent` values. Consumers that need live pane output or lifecycle
+state can wait for `%output`, `%pane-died`, `%pane-exited`, and related
+notifications instead of sleeping and polling `capture-pane`.
+
 ## Registry
 
 Persistent key-to-pane mappings stored as JSON. See [Registry](./registry.md).
