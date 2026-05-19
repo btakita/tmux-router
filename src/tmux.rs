@@ -37,6 +37,8 @@
 //!   pane in the sole window of its session to prevent accidental session destruction.
 //! - `session_window_count(session)` — counts windows in a session.
 //! - `pane_window(pane_id)` / `pane_session(target)` — resolve containment hierarchy.
+//! - `current_session()` — resolves the caller's tmux session, preferring the
+//!   `TMUX_PANE` owner pane over the attached client's currently selected session.
 //! - `ensure_pane_in_session(pane_id, expected_session)` — fail closed when a pane
 //!   drifted into a different tmux session than the caller expects.
 //! - `list_window_panes(window_id)` — lists all pane IDs in a window.
@@ -539,6 +541,42 @@ impl Tmux {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Get the current tmux session for this process.
+    ///
+    /// When `TMUX_PANE` is available, target that pane explicitly. Bare
+    /// `display-message -p "#{session_name}"` follows tmux's current client
+    /// context, which can differ from the pane running this process when an
+    /// operator has another session selected.
+    pub fn current_session(&self) -> Option<String> {
+        let current_pane = std::env::var("TMUX_PANE").ok();
+        self.current_session_for_pane(current_pane.as_deref())
+    }
+
+    /// Resolve current session using an optional pane override.
+    ///
+    /// This is public primarily for deterministic tests and integrations that
+    /// already know the controlling pane. It falls back to tmux's default
+    /// current-context lookup when the pane is missing or stale.
+    pub fn current_session_for_pane(&self, current_pane: Option<&str>) -> Option<String> {
+        if let Some(pane) = current_pane.map(str::trim).filter(|pane| !pane.is_empty())
+            && let Ok(session) = self.pane_session(pane)
+            && !session.is_empty()
+        {
+            return Some(session);
+        }
+
+        let output = self
+            .cmd()
+            .args(["display-message", "-p", "#{session_name}"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
     }
 
     /// Require that a pane belongs to the expected tmux session.
@@ -1384,6 +1422,31 @@ mod tmux_tests {
         assert!(
             err.to_string().contains("expected 'sess-a'"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn current_session_for_pane_prefers_owner_pane() {
+        let iso = IsolatedTmux::new("tmux-current-session-pane");
+        let owner_pane = iso.new_session("owner", Path::new("/tmp")).unwrap();
+        let _other_pane = iso.new_session("other", Path::new("/tmp")).unwrap();
+
+        assert_eq!(
+            iso.current_session_for_pane(Some(&owner_pane)).as_deref(),
+            Some("owner"),
+            "current session should resolve from the pane running the process"
+        );
+    }
+
+    #[test]
+    fn current_session_for_pane_falls_back_when_pane_is_stale() {
+        let iso = IsolatedTmux::new("tmux-current-session-fallback");
+        let _pane = iso.new_session("fallback", Path::new("/tmp")).unwrap();
+
+        assert_eq!(
+            iso.current_session_for_pane(Some("%99999")).as_deref(),
+            Some("fallback"),
+            "stale TMUX_PANE should fall back to tmux's current context"
         );
     }
 
