@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Protected outgoing on a 1-in/1-out reconcile preserves layout (`#jb-nav-3pane-promote-swap`).** When the SWAP fast path detects exactly one pane to attach and one to detach but the outgoing pane is protected (busy / `protect_pane`), `reconcile` no longer falls through to ATTACH-the-incoming while DETACH skips the busy outgoing pane — that grew the window to N+1 panes (the "3 panes for a 2-column editor" navigation regression). It now preserves the current layout, leaves the incoming pane stashed, and defers so the caller's retry resurfaces it once the pane frees.
 - **OpenCode submit can use Kitty keyboard Return.** `Tmux::send_keys_with_kitty_return()` sends the literal payload, waits for the canonical submit delay, then emits the Kitty keyboard `Return` sequence as literal bytes. This lets OpenCode callers avoid panes that interpret bare tmux `Enter` as `ctrl+j` newline input.
 - **RegistryEntry docs/tests now lock the current supervisor fields.** The API
   and registry docs now list `session_id` and `supervisor_instance_id`, and

@@ -1046,10 +1046,22 @@ pub fn reconcile(
             .map(|protect| protect(outgoing))
             .unwrap_or(false)
         {
+            // 1-in/1-out where the only pane we could displace is protected
+            // (busy). Falling through to ATTACH would join the incoming pane
+            // while DETACH skips the protected outgoing one, growing the window
+            // to N+1 panes — the #jb-nav-3pane-promote-swap regression. Preserve
+            // the current layout instead and leave the incoming pane in its
+            // stash; the caller's deferred-retry resurfaces it once the busy
+            // pane frees up. Do not select the incoming pane (it is still
+            // stashed) so we never surface a pane inside the stash window.
             log.log(
                 "SWAP",
-                format!("skipped {} — protected (busy pane)", outgoing),
+                format!(
+                    "preserved layout — incoming {} deferred; outgoing {} protected (busy pane)",
+                    incoming, outgoing
+                ),
             );
+            return Ok(log);
         } else {
             // Only swap if the incoming pane is alive and SessionScope allows it
             if tmux.pane_window(incoming).is_ok() {
@@ -3753,6 +3765,89 @@ mod tests {
         assert!(
             win_count <= 3,
             "at most 3 windows: target + stash + 1 shell"
+        );
+    }
+
+    #[test]
+    fn test_reconcile_1in1out_protected_outgoing_preserves_layout() {
+        // #jb-nav-3pane-promote-swap: a 1-in/1-out tab switch where the pane to
+        // be displaced is protected (busy) must NOT grow the window to 3 panes.
+        // Previously the SWAP fast path skipped the protected outgoing pane and
+        // fell through to ATTACH (joined the incoming) + DETACH (skipped the
+        // busy outgoing), leaving 3 panes. It must now preserve the current
+        // 2-pane layout and leave the incoming pane in its stash.
+        let t = IsolatedTmux::new("sync-test-1in1out-protected");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-x", "200", "-y", "60"]);
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+        let pane_c = t.new_window("test", tmp.path()).unwrap();
+
+        let target_window = t.pane_window(&pane_a).unwrap();
+
+        // Build the starting layout: [[A], [C]] visible, B parked elsewhere.
+        let cols1 = vec![vec![pane_a.clone()], vec![pane_c.clone()]];
+        let desired1: Vec<&str> = vec![pane_a.as_str(), pane_c.as_str()];
+        reconcile(
+            &t,
+            &target_window,
+            &cols1,
+            &desired1,
+            Some("test"),
+            Some(&pane_a),
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
+        let before = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(before.len(), 2, "start layout should be 2 panes: {before:?}");
+
+        // Now navigate to B (incoming) which would displace A (outgoing) — but A
+        // is protected/busy. desired = [[B], [C]].
+        let cols2 = vec![vec![pane_b.clone()], vec![pane_c.clone()]];
+        let desired2: Vec<&str> = vec![pane_b.as_str(), pane_c.as_str()];
+        let pane_a_protected = pane_a.clone();
+        let protect = move |p: &str| p == pane_a_protected;
+        let opts = SyncOptions {
+            protect_pane: Some(&protect),
+            ..SyncOptions::default()
+        };
+        let log = reconcile(
+            &t,
+            &target_window,
+            &cols2,
+            &desired2,
+            Some("test"),
+            Some(&pane_b),
+            &dummy_registry_path(),
+            &opts,
+        )
+        .unwrap();
+        assert!(!log.has_errors(), "reconcile errors: {:?}", log.entries());
+
+        // Layout preserved: still exactly the 2 original panes; B not joined.
+        let after = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(
+            after.len(),
+            2,
+            "protected 1-in/1-out must not grow to 3 panes: {after:?}"
+        );
+        assert!(
+            after.contains(&pane_a) && after.contains(&pane_c),
+            "original panes A and C must remain visible: {after:?}"
+        );
+        assert!(
+            !after.contains(&pane_b),
+            "incoming B must stay stashed while outgoing A is busy: {after:?}"
+        );
+        // A "preserved layout" entry should record the deferral.
+        assert!(
+            log.entries()
+                .iter()
+                .any(|e| e.message.contains("preserved layout") && e.message.contains("protected")),
+            "expected preserved-layout log entry: {:?}",
+            log.entries()
         );
     }
 
