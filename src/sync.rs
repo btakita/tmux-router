@@ -380,6 +380,36 @@ pub fn find_column_pane(
     None
 }
 
+/// Resolve which pane the `--focus` file should select after sync.
+///
+/// Focus must only ever select the focus document's OWN live pane. A document's
+/// owned pane is its registry-resolved, alive pane captured before any ephemeral
+/// donor / spare-pane assignment runs. If the focus document has no owned pane
+/// of its own (for example its registered pane died after a Codex supervisor
+/// restart), this returns `None` so the caller preserves the current tmux
+/// selection — it must NEVER alias onto a column-mate's pane, which belongs to a
+/// different document's session and would hand tmux focus to the wrong document.
+///
+/// - `focus == None` selects the anchor pane (default layout focus).
+/// - a non-managed focus file returns `None` (preserve selection).
+/// - a managed focus file returns its owned pane, or `None` if it has none.
+pub fn resolve_focus_pane(
+    focus: Option<&Path>,
+    non_managed: &[PathBuf],
+    focus_owned_pane: Option<&str>,
+    anchor_pane: &str,
+) -> Option<String> {
+    match focus {
+        None => Some(anchor_pane.to_string()),
+        Some(focus_path) => {
+            if non_managed.iter().any(|p| p.as_path() == focus_path) {
+                return None;
+            }
+            focus_owned_pane.map(|p| p.to_string())
+        }
+    }
+}
+
 /// Find the best window for consolidating wanted panes.
 /// Prefers the window (within the target session) that already contains the most wanted panes.
 pub fn find_best_window(
@@ -572,6 +602,19 @@ pub fn sync_with_options(
             file.display()
         );
     }
+
+    // Capture the focus document's authoritative owned pane BEFORE Phase 1.5/1.75
+    // ephemeral assignment. `resolved` currently holds only registry-bound, alive
+    // panes, so this is the only pane focus is ever allowed to select. Ephemeral
+    // donor / spare panes added below belong to other documents and must never
+    // receive tmux focus on behalf of this file.
+    let focus_owned_pane: Option<String> = focus.and_then(|focus_file| {
+        let focus_path = PathBuf::from(focus_file);
+        resolved
+            .iter()
+            .find(|r| r.path == focus_path)
+            .map(|r| r.pane_id.clone())
+    });
 
     // Build a lookup from file path -> pane_id (mutable for Phase 1.5 auto-register)
     let mut file_to_pane: std::collections::HashMap<PathBuf, String> = resolved
@@ -842,22 +885,24 @@ pub fn sync_with_options(
         .collect();
     let desired_ordered_refs: Vec<&str> = desired_ordered.iter().map(|s| s.as_str()).collect();
 
-    // Resolve --focus to a pane ID (Option: None preserves current tmux selection)
-    let focus_pane: Option<String> = if let Some(focus_file) = focus {
-        let focus_path = PathBuf::from(focus_file);
-        if non_managed_files.contains(&focus_path) {
-            // Non-managed file -> preserve tmux selection
-            None
-        } else if let Some(pane) = file_to_pane.get(&focus_path) {
-            // Directly resolved (includes auto-registered)
-            Some(pane.clone())
-        } else {
-            // Column-positional fallback: find first pane in same column
-            find_column_pane(&layout, &focus_path, &file_to_pane)
-        }
-    } else {
-        Some(anchor_pane.clone())
-    };
+    // Resolve --focus to a pane ID (Option: None preserves current tmux selection).
+    // Focus is keyed strictly on the focus document's OWN live pane — never an
+    // ephemeral donor / column-mate, which belongs to a different document.
+    let focus_pane: Option<String> = resolve_focus_pane(
+        focus.map(Path::new),
+        &non_managed_files,
+        focus_owned_pane.as_deref(),
+        &anchor_pane,
+    );
+    if let Some(focus_file) = focus
+        && focus_pane.is_none()
+        && !non_managed_files.contains(&PathBuf::from(focus_file))
+    {
+        eprintln!(
+            "focus {} has no live owned pane — preserving tmux selection (not aliasing onto a neighbor's pane)",
+            focus_file
+        );
+    }
 
     // --- Phase 5: Reconcile (attach-first: attach -> select -> detach) ---
     {
@@ -4095,6 +4140,43 @@ mod tests {
             Some("%39".to_string()),
             "claimed left file -> select left pane"
         );
+    }
+
+    #[test]
+    fn test_resolve_focus_pane_uses_owned_pane() {
+        // Focus document has its own live pane -> select it.
+        let focus = PathBuf::from("agent-doc-bugs2.md");
+        let result = resolve_focus_pane(Some(&focus), &[], Some("%70"), "%1");
+        assert_eq!(result, Some("%70".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_focus_pane_never_aliases_onto_neighbor() {
+        // Regression for cross-document focus mis-binding: when the focus
+        // document has no live owned pane (e.g. its registered pane died after a
+        // Codex restart), focus must preserve selection rather than jumping to a
+        // column-mate's pane belonging to another document (e.g. the
+        // equityfundingsource.md pane).
+        let focus = PathBuf::from("agent-doc-bugs2.md");
+        let result = resolve_focus_pane(Some(&focus), &[], None, "%99");
+        assert_eq!(
+            result, None,
+            "no owned pane must preserve selection, not anchor or neighbor"
+        );
+    }
+
+    #[test]
+    fn test_resolve_focus_pane_non_managed_preserves_selection() {
+        let focus = PathBuf::from("readme.txt");
+        let non_managed = vec![PathBuf::from("readme.txt")];
+        let result = resolve_focus_pane(Some(&focus), &non_managed, Some("%5"), "%1");
+        assert_eq!(result, None, "non-managed focus file preserves selection");
+    }
+
+    #[test]
+    fn test_resolve_focus_pane_no_focus_selects_anchor() {
+        let result = resolve_focus_pane(None, &[], None, "%7");
+        assert_eq!(result, Some("%7".to_string()), "no --focus selects anchor");
     }
 
     #[test]
