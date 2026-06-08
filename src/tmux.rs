@@ -764,6 +764,76 @@ impl Tmux {
         if win.is_empty() { None } else { Some(win) }
     }
 
+    /// List the window names in a tmux session.
+    ///
+    /// Returns an empty vector if the session does not exist (tmux errors) or
+    /// has no windows. Used by superseded-session cleanup to decide whether a
+    /// session holds only agent-doc-managed windows.
+    pub fn list_window_names(&self, session_name: &str) -> Vec<String> {
+        let output = match self
+            .cmd()
+            .args([
+                "list-windows",
+                "-t",
+                &format!("{}:", session_name),
+                "-F",
+                "#{window_name}",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// List the pane IDs in a tmux session (across all of its windows).
+    ///
+    /// Returns an empty vector if the session does not exist or has no panes.
+    pub fn list_session_panes(&self, session_name: &str) -> Vec<String> {
+        let output = match self
+            .cmd()
+            .args([
+                "list-panes",
+                "-s",
+                "-t",
+                &format!("{}:", session_name),
+                "-F",
+                "#{pane_id}",
+            ])
+            .output()
+        {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    }
+
+    /// Close (kill) a tmux session by name.
+    pub fn kill_session(&self, name: &str) -> Result<()> {
+        let output = self
+            .cmd()
+            .args(["kill-session", "-t", &format!("{}:", name)])
+            .output()
+            .context("failed to run tmux kill-session")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux kill-session failed for '{}': {}",
+                name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     /// Find a window named "stash" in the given tmux session.
     pub fn find_stash_window(&self, session_name: &str) -> Option<String> {
         let output = self
