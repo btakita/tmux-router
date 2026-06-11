@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Standalone CI no longer requires sibling dev checkouts.** Removed unused `existence` and `module-harness` dev-dependencies so `cargo clippy` and `cargo test` work in the standalone `tmux-router` repository checkout used by GitHub Actions.
 - **Protected outgoing on a 1-in/1-out reconcile preserves layout (`#jb-nav-3pane-promote-swap`).** When the SWAP fast path detects exactly one pane to attach and one to detach but the outgoing pane is protected (busy / `protect_pane`), `reconcile` no longer falls through to ATTACH-the-incoming while DETACH skips the busy outgoing pane — that grew the window to N+1 panes (the "3 panes for a 2-column editor" navigation regression). It now preserves the current layout, leaves the incoming pane stashed, and defers so the caller's retry resurfaces it once the pane frees.
 - **OpenCode submit can use Kitty keyboard Return.** `Tmux::send_keys_with_kitty_return()` sends one tmux hex-byte payload ending in the Kitty keyboard `Return` sequence. This lets OpenCode callers avoid panes that interpret bare tmux carriage return as newline input.
 - **RegistryEntry docs/tests now lock the current supervisor fields.** The API

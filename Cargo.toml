@@ -15,7 +15,5 @@ serde_json = "1"
 fs2 = "0.4"
 
 [dev-dependencies]
-existence = { path = "../existence-lang/existence" }
-module-harness = { path = "../module-harness" }
 proptest = "1"
 tempfile = "3"
