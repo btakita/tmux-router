@@ -19,8 +19,8 @@
 //! - `new_window(session, cwd)` — creates a new window in an existing session and
 //!   returns the pane ID; uses `session:` target syntax to avoid numeric-name ambiguity.
 //! - `send_keys(pane_id, text)` — sends one submitted command to a pane by
-//!   sending literal text (`-l`), waiting briefly, then sending a named
-//!   `Enter` key.
+//!   sending one hex-encoded UTF-8 byte payload (`-H`) that ends with carriage
+//!   return.
 //! - `send_key(pane_id, key)` — sends a single tmux key name (for example `Enter`,
 //!   `Up`, `Escape`) without enabling literal mode.
 //! - `send_keys_raw(pane_id, keys)` — sends keystrokes without literal mode or Enter,
@@ -88,8 +88,9 @@
 //!   breaks-to-stash, or returns an error.
 //! - `select_pane` never disrupts other connected terminal clients (`switch-client`
 //!   is intentionally omitted).
-//! - `send_keys` always appends exactly one submit keystroke. Trailing `\r` or
-//!   `\n` in `text` are normalized away before that submit is appended.
+//! - `send_keys` always appends exactly one carriage-return submit byte in the
+//!   same tmux byte-stream command as the text. Trailing `\r` or `\n` in `text` are
+//!   normalized away before that submit is appended.
 //! - `send_keys` interprets its `text` argument literally (no tmux key
 //!   expansion). Use `send_key` / `send_keys_raw` when key names like `C-c` or
 //!   `Enter` are required.
@@ -110,10 +111,8 @@
 //!   without "index 0 in use" error.
 //! - `send_keys_literal`: text containing tmux special chars (e.g. `q`, `C-c`) is sent
 //!   as-is and not interpreted as key sequences.
-//! - `send_keys_ascii_delayed_submit`: ASCII text is sent as literal text,
-//!   then a short delay is inserted before the submit `Enter` key so managed
-//!   TUIs like Codex treat the key as a real submit instead of leaving the
-//!   command drafted in the composer.
+//! - `send_keys_literal_cr_submit`: text is sent as UTF-8 bytes ending in
+//!   carriage return so managed TUIs receive text and submit as one byte stream.
 //! - `auto_start_creates_session`: with no server running, `auto_start` creates a session
 //!   and returns a non-empty pane ID.
 //! - `auto_start_creates_window`: with an existing session, `auto_start` adds a window
@@ -137,9 +136,8 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
 
-const SEND_KEYS_SUBMIT_DELAY: Duration = Duration::from_millis(50);
+const CARRIAGE_RETURN_SEQUENCE: &str = "\r";
 const KITTY_RETURN_SEQUENCE: &str = "\x1b[13u";
 
 /// Tmux server handle — supports isolated `-L` servers for testing.
@@ -298,46 +296,39 @@ impl Tmux {
     /// Send keys to a tmux pane.
     ///
     /// Normalizes away trailing line endings in `text`, then appends exactly
-    /// one submit keystroke after a short delay. Codex's composer can leave the
-    /// command drafted when the literal text and `Enter` arrive in the same
-    /// tmux tick, so the delay is part of the canonical submit contract.
+    /// one carriage-return submit byte in the same tmux byte-stream command.
+    /// Managed TUI composers can leave long owner prompts drafted when text and
+    /// submit arrive as separate tmux events, so the canonical submit contract
+    /// is one UTF-8 byte stream ending in `\r`.
     pub fn send_keys(&self, pane_id: &str, text: &str) -> Result<()> {
-        let text = normalize_send_keys_text(text);
+        let payload = submit_hex_args(text, CARRIAGE_RETURN_SEQUENCE);
         let status = self
             .cmd()
-            .args(["send-keys", "-t", pane_id, "-l", text])
+            .args(["send-keys", "-t", pane_id, "-H"])
+            .args(&payload)
             .status()
-            .context("failed to run tmux send-keys (literal)")?;
+            .context("failed to run tmux send-keys (hex submit)")?;
         if !status.success() {
             anyhow::bail!("tmux send-keys failed for pane {}", pane_id);
         }
-        std::thread::sleep(SEND_KEYS_SUBMIT_DELAY);
-        self.send_key(pane_id, "Enter")
+        Ok(())
     }
 
-    /// Send literal text, then submit with Kitty keyboard protocol Return.
+    /// Send literal text and submit with Kitty keyboard protocol Return.
     ///
     /// OpenCode can distinguish `return` from `ctrl+j` through enhanced
     /// keyboard sequences. A plain tmux `Enter` injects a carriage return,
     /// which some OpenCode panes treat as newline input instead of submit.
     pub fn send_keys_with_kitty_return(&self, pane_id: &str, text: &str) -> Result<()> {
-        let text = normalize_send_keys_text(text);
+        let payload = submit_hex_args(text, KITTY_RETURN_SEQUENCE);
         let status = self
             .cmd()
-            .args(["send-keys", "-t", pane_id, "-l", text])
+            .args(["send-keys", "-t", pane_id, "-H"])
+            .args(&payload)
             .status()
-            .context("failed to run tmux send-keys (literal)")?;
+            .context("failed to run tmux send-keys (hex submit)")?;
         if !status.success() {
             anyhow::bail!("tmux send-keys failed for pane {}", pane_id);
-        }
-        std::thread::sleep(SEND_KEYS_SUBMIT_DELAY);
-        let status = self
-            .cmd()
-            .args(["send-keys", "-t", pane_id, "-l", KITTY_RETURN_SEQUENCE])
-            .status()
-            .context("failed to run tmux send-keys (kitty return)")?;
-        if !status.success() {
-            anyhow::bail!("tmux send-keys kitty return failed for pane {}", pane_id);
         }
         Ok(())
     }
@@ -1260,45 +1251,43 @@ fn normalize_send_keys_text(text: &str) -> &str {
     text.trim_end_matches(['\r', '\n'])
 }
 
-#[cfg(test)]
-fn send_keys_delayed_submit_commands(pane_id: &str, text: &str) -> [Vec<String>; 2] {
+fn submit_bytes(text: &str, submit_sequence: &str) -> Vec<u8> {
     let text = normalize_send_keys_text(text);
-    [
-        vec![
-            "send-keys".into(),
-            "-t".into(),
-            pane_id.into(),
-            "-l".into(),
-            text.into(),
-        ],
-        vec![
-            "send-keys".into(),
-            "-t".into(),
-            pane_id.into(),
-            "Enter".into(),
-        ],
-    ]
+    let mut payload = Vec::with_capacity(text.len() + submit_sequence.len());
+    payload.extend_from_slice(text.as_bytes());
+    payload.extend_from_slice(submit_sequence.as_bytes());
+    payload
+}
+
+fn submit_hex_args(text: &str, submit_sequence: &str) -> Vec<String> {
+    submit_bytes(text, submit_sequence)
+        .into_iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
-fn send_keys_kitty_return_submit_commands(pane_id: &str, text: &str) -> [Vec<String>; 2] {
-    let text = normalize_send_keys_text(text);
-    [
-        vec![
-            "send-keys".into(),
-            "-t".into(),
-            pane_id.into(),
-            "-l".into(),
-            text.into(),
-        ],
-        vec![
-            "send-keys".into(),
-            "-t".into(),
-            pane_id.into(),
-            "-l".into(),
-            KITTY_RETURN_SEQUENCE.into(),
-        ],
-    ]
+fn send_keys_literal_submit_command(pane_id: &str, text: &str) -> Vec<String> {
+    let mut command = vec![
+        "send-keys".into(),
+        "-t".into(),
+        pane_id.into(),
+        "-H".into(),
+    ];
+    command.extend(submit_hex_args(text, CARRIAGE_RETURN_SEQUENCE));
+    command
+}
+
+#[cfg(test)]
+fn send_keys_kitty_return_submit_command(pane_id: &str, text: &str) -> Vec<String> {
+    let mut command = vec![
+        "send-keys".into(),
+        "-t".into(),
+        pane_id.into(),
+        "-H".into(),
+    ];
+    command.extend(submit_hex_args(text, KITTY_RETURN_SEQUENCE));
+    command
 }
 
 /// RAII guard that kills the isolated tmux server on drop.
@@ -1475,6 +1464,18 @@ mod tmux_tests {
         predicate()
     }
 
+    fn command_prefix(command: &[String]) -> Vec<&str> {
+        command.iter().take(4).map(String::as_str).collect()
+    }
+
+    fn command_payload_bytes(command: &[String]) -> Vec<u8> {
+        command
+            .iter()
+            .skip(4)
+            .map(|hex| u8::from_str_radix(hex, 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn ensure_pane_in_session_accepts_matching_session() {
         let iso = IsolatedTmux::new("tmux-ensure-session-ok");
@@ -1536,169 +1537,85 @@ mod tmux_tests {
     }
 
     #[test]
-    fn send_keys_delayed_submit_commands_keep_submit_shape_stable() {
+    fn send_keys_literal_submit_command_keeps_submit_shape_stable() {
+        let command =
+            send_keys_literal_submit_command("%7", "agent-doc tasks/agent-doc/agent-doc-bugs2.md");
+        assert_eq!(command_prefix(&command), ["send-keys", "-t", "%7", "-H"]);
         assert_eq!(
-            send_keys_delayed_submit_commands("%7", "agent-doc tasks/agent-doc/agent-doc-bugs2.md"),
-            [
-                vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    "%7".to_string(),
-                    "-l".to_string(),
-                    "agent-doc tasks/agent-doc/agent-doc-bugs2.md".to_string(),
-                ],
-                vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    "%7".to_string(),
-                    "Enter".to_string(),
-                ],
-            ]
+            command_payload_bytes(&command),
+            b"agent-doc tasks/agent-doc/agent-doc-bugs2.md\r"
         );
     }
 
     #[test]
     fn send_keys_paths_trim_trailing_line_endings_before_submit() {
-        assert_eq!(
-            send_keys_delayed_submit_commands("%9", "/clear\r\n"),
-            [
-                vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    "%9".to_string(),
-                    "-l".to_string(),
-                    "/clear".to_string(),
-                ],
-                vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    "%9".to_string(),
-                    "Enter".to_string(),
-                ],
-            ]
-        );
-        assert_eq!(
-            send_keys_delayed_submit_commands("%9", "café\n"),
-            [
-                vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    "%9".to_string(),
-                    "-l".to_string(),
-                    "café".to_string(),
-                ],
-                vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    "%9".to_string(),
-                    "Enter".to_string(),
-                ],
-            ]
-        );
-    }
+        let clear = send_keys_literal_submit_command("%9", "/clear\r\n");
+        assert_eq!(command_prefix(&clear), ["send-keys", "-t", "%9", "-H"]);
+        assert_eq!(command_payload_bytes(&clear), b"/clear\r");
 
-    #[test]
-    fn send_keys_submit_delay_is_long_enough_for_managed_tuis() {
-        assert_eq!(SEND_KEYS_SUBMIT_DELAY, Duration::from_millis(50));
+        let non_ascii = send_keys_literal_submit_command("%9", "café\n");
+        assert_eq!(
+            command_payload_bytes(&non_ascii),
+            "café\r".as_bytes()
+        );
     }
 
     #[test]
     fn send_keys_kitty_return_uses_enhanced_return_sequence() {
+        let command = send_keys_kitty_return_submit_command("%9", "agent-doc plan.md\n");
+        assert_eq!(command_prefix(&command), ["send-keys", "-t", "%9", "-H"]);
         assert_eq!(
-            send_keys_kitty_return_submit_commands("%9", "agent-doc plan.md\n"),
-            [
-                vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    "%9".to_string(),
-                    "-l".to_string(),
-                    "agent-doc plan.md".to_string(),
-                ],
-                vec![
-                    "send-keys".to_string(),
-                    "-t".to_string(),
-                    "%9".to_string(),
-                    "-l".to_string(),
-                    "\x1b[13u".to_string(),
-                ],
-            ]
+            command_payload_bytes(&command),
+            b"agent-doc plan.md\x1b[13u"
         );
     }
 
     #[test]
-    fn send_keys_waits_before_submit_key() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let iso = IsolatedTmux::new("tmux-send-keys-submit-delay");
-        let pane = iso.new_session("sess-delay", Path::new("/tmp")).unwrap();
-        let script = std::env::temp_dir().join(format!(
-            "tmux-send-keys-delay-{}-{}.py",
+    fn send_keys_sends_literal_payload_with_carriage_return_submit() {
+        let iso = IsolatedTmux::new("tmux-send-keys-literal-cr");
+        let pane = iso
+            .new_session("sess-literal-cr", Path::new("/tmp"))
+            .unwrap();
+        let output = std::env::temp_dir().join(format!(
+            "tmux-send-keys-literal-cr-{}-{}.bin",
             std::process::id(),
             std::thread::current().name().unwrap_or("anon")
         ));
-        std::fs::write(
-            &script,
-            r#"#!/usr/bin/env python3
-import os
-import sys
-import termios
-import time
-import tty
-
-fd = sys.stdin.fileno()
-saved = termios.tcgetattr(fd)
-try:
-    tty.setraw(fd)
-    os.write(sys.stdout.fileno(), b"READY\n")
-    buf = bytearray()
-    last_char_ms = 0
-    while True:
-        ch = os.read(fd, 1)
-        if not ch:
-            break
-        now = time.monotonic_ns() // 1_000_000
-        if ch in (b"\r", b"\n"):
-            if not buf:
-                continue
-            delta = now - last_char_ms
-            prefix = b"SUBMITTED:" if delta >= 40 else b"DRAFT:"
-            os.write(sys.stdout.fileno(), prefix + bytes(buf) + b"\n")
-            break
-        buf.extend(ch)
-        last_char_ms = now
-finally:
-    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
-"#,
-        )
-        .unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-        iso.send_keys(&pane, &format!("exec {}", script.display()))
+        let done = output.with_extension("done");
+        let ready = output.with_extension("ready");
+        let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(&done);
+        let _ = std::fs::remove_file(&ready);
+        let expected = b"/clear\r";
+        let reader = format!(
+            "sh -lc 'stty raw -echo; touch {}; dd bs=1 count={} of={} 2>/dev/null; touch {}'",
+            ready.display(),
+            expected.len(),
+            output.display(),
+            done.display()
+        );
+        let setup_status = iso
+            .cmd()
+            .args(["send-keys", "-t", &pane, "-l"])
+            .arg(&reader)
+            .status()
             .unwrap();
+        assert!(setup_status.success());
+        iso.send_key(&pane, "Enter").unwrap();
         assert!(
-            wait_for(Duration::from_secs(3), || {
-                iso.capture_pane(&pane, Some(20))
-                    .map(|content| content.contains("READY"))
-                    .unwrap_or(false)
-            }),
-            "mock TUI did not become ready"
+            wait_for(Duration::from_secs(3), || ready.exists()),
+            "raw reader did not become ready"
         );
         iso.send_keys(&pane, "/clear").unwrap();
         assert!(
-            wait_for(Duration::from_secs(3), || {
-                iso.capture_pane(&pane, Some(20))
-                    .map(|content| content.contains("SUBMITTED:/clear"))
-                    .unwrap_or(false)
-            }),
-            "delayed submit should be observed as a submitted command"
+            wait_for(Duration::from_secs(3), || done.exists()),
+            "raw reader did not capture submitted payload"
         );
-        let content = iso.capture_pane(&pane, Some(20)).unwrap();
-        assert!(
-            !content.contains("DRAFT:/clear"),
-            "submit helper should not leave the command drafted: {content}"
-        );
-        let _ = std::fs::remove_file(&script);
+        let bytes = std::fs::read(&output).unwrap();
+        assert_eq!(bytes, expected);
+        let _ = std::fs::remove_file(&output);
+        let _ = std::fs::remove_file(&done);
+        let _ = std::fs::remove_file(&ready);
     }
 
     #[test]
