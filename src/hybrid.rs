@@ -35,7 +35,7 @@ pub enum PaneOutputBackend {
 /// Input submission backend for a pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneInputBackend {
-    /// Literal text submitted as one payload ending in carriage return.
+    /// Literal text submitted through tmux with a named Enter key.
     TmuxEnter,
     /// Literal text submitted as one payload ending in a Kitty keyboard-protocol Return sequence.
     TmuxKittyReturn,

@@ -19,8 +19,8 @@
 //! - `new_window(session, cwd)` — creates a new window in an existing session and
 //!   returns the pane ID; uses `session:` target syntax to avoid numeric-name ambiguity.
 //! - `send_keys(pane_id, text)` — sends one submitted command to a pane by
-//!   sending one hex-encoded UTF-8 byte payload (`-H`) that ends with carriage
-//!   return.
+//!   sending literal text, then a named `Enter` key, in one tmux process
+//!   invocation.
 //! - `send_key(pane_id, key)` — sends a single tmux key name (for example `Enter`,
 //!   `Up`, `Escape`) without enabling literal mode.
 //! - `send_keys_raw(pane_id, keys)` — sends keystrokes without literal mode or Enter,
@@ -88,9 +88,9 @@
 //!   breaks-to-stash, or returns an error.
 //! - `select_pane` never disrupts other connected terminal clients (`switch-client`
 //!   is intentionally omitted).
-//! - `send_keys` always appends exactly one carriage-return submit byte in the
-//!   same tmux byte-stream command as the text. Trailing `\r` or `\n` in `text` are
-//!   normalized away before that submit is appended.
+//! - `send_keys` always appends exactly one named `Enter` submit key in the same
+//!   tmux process invocation as the literal text. Trailing `\r` or `\n` in `text`
+//!   are normalized away before that submit is appended.
 //! - `send_keys` interprets its `text` argument literally (no tmux key
 //!   expansion). Use `send_key` / `send_keys_raw` when key names like `C-c` or
 //!   `Enter` are required.
@@ -111,8 +111,8 @@
 //!   without "index 0 in use" error.
 //! - `send_keys_literal`: text containing tmux special chars (e.g. `q`, `C-c`) is sent
 //!   as-is and not interpreted as key sequences.
-//! - `send_keys_literal_cr_submit`: text is sent as UTF-8 bytes ending in
-//!   carriage return so managed TUIs receive text and submit as one byte stream.
+//! - `send_keys_literal_enter_submit`: text is sent literally and submitted with
+//!   a named `Enter` key in one tmux process invocation.
 //! - `auto_start_creates_session`: with no server running, `auto_start` creates a session
 //!   and returns a non-empty pane ID.
 //! - `auto_start_creates_window`: with an existing session, `auto_start` adds a window
@@ -137,7 +137,6 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
-const CARRIAGE_RETURN_SEQUENCE: &str = "\r";
 const KITTY_RETURN_SEQUENCE: &str = "\x1b[13u";
 
 /// Tmux server handle — supports isolated `-L` servers for testing.
@@ -296,18 +295,16 @@ impl Tmux {
     /// Send keys to a tmux pane.
     ///
     /// Normalizes away trailing line endings in `text`, then appends exactly
-    /// one carriage-return submit byte in the same tmux byte-stream command.
+    /// one named `Enter` key in the same tmux process invocation.
     /// Managed TUI composers can leave long owner prompts drafted when text and
-    /// submit arrive as separate tmux events, so the canonical submit contract
-    /// is one UTF-8 byte stream ending in `\r`.
+    /// submit arrive from separate subprocesses, so the canonical submit
+    /// contract is one tmux invocation containing literal text plus `Enter`.
     pub fn send_keys(&self, pane_id: &str, text: &str) -> Result<()> {
-        let payload = submit_hex_args(text, CARRIAGE_RETURN_SEQUENCE);
         let status = self
             .cmd()
-            .args(["send-keys", "-t", pane_id, "-H"])
-            .args(&payload)
+            .args(send_keys_literal_submit_command(pane_id, text))
             .status()
-            .context("failed to run tmux send-keys (hex submit)")?;
+            .context("failed to run tmux send-keys (literal text + Enter)")?;
         if !status.success() {
             anyhow::bail!("tmux send-keys failed for pane {}", pane_id);
         }
@@ -1266,26 +1263,33 @@ fn submit_hex_args(text: &str, submit_sequence: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
 fn send_keys_literal_submit_command(pane_id: &str, text: &str) -> Vec<String> {
-    let mut command = vec![
+    let text = normalize_send_keys_text(text);
+    if text.is_empty() {
+        return vec![
+            "send-keys".into(),
+            "-t".into(),
+            pane_id.into(),
+            "Enter".into(),
+        ];
+    }
+    vec![
         "send-keys".into(),
         "-t".into(),
         pane_id.into(),
-        "-H".into(),
-    ];
-    command.extend(submit_hex_args(text, CARRIAGE_RETURN_SEQUENCE));
-    command
+        "-l".into(),
+        text.into(),
+        ";".into(),
+        "send-keys".into(),
+        "-t".into(),
+        pane_id.into(),
+        "Enter".into(),
+    ]
 }
 
 #[cfg(test)]
 fn send_keys_kitty_return_submit_command(pane_id: &str, text: &str) -> Vec<String> {
-    let mut command = vec![
-        "send-keys".into(),
-        "-t".into(),
-        pane_id.into(),
-        "-H".into(),
-    ];
+    let mut command = vec!["send-keys".into(), "-t".into(), pane_id.into(), "-H".into()];
     command.extend(submit_hex_args(text, KITTY_RETURN_SEQUENCE));
     command
 }
@@ -1540,24 +1544,64 @@ mod tmux_tests {
     fn send_keys_literal_submit_command_keeps_submit_shape_stable() {
         let command =
             send_keys_literal_submit_command("%7", "agent-doc tasks/agent-doc/agent-doc-bugs2.md");
-        assert_eq!(command_prefix(&command), ["send-keys", "-t", "%7", "-H"]);
         assert_eq!(
-            command_payload_bytes(&command),
-            b"agent-doc tasks/agent-doc/agent-doc-bugs2.md\r"
+            command,
+            [
+                "send-keys",
+                "-t",
+                "%7",
+                "-l",
+                "agent-doc tasks/agent-doc/agent-doc-bugs2.md",
+                ";",
+                "send-keys",
+                "-t",
+                "%7",
+                "Enter",
+            ]
         );
     }
 
     #[test]
     fn send_keys_paths_trim_trailing_line_endings_before_submit() {
         let clear = send_keys_literal_submit_command("%9", "/clear\r\n");
-        assert_eq!(command_prefix(&clear), ["send-keys", "-t", "%9", "-H"]);
-        assert_eq!(command_payload_bytes(&clear), b"/clear\r");
+        assert_eq!(
+            clear,
+            [
+                "send-keys",
+                "-t",
+                "%9",
+                "-l",
+                "/clear",
+                ";",
+                "send-keys",
+                "-t",
+                "%9",
+                "Enter",
+            ]
+        );
 
         let non_ascii = send_keys_literal_submit_command("%9", "café\n");
         assert_eq!(
-            command_payload_bytes(&non_ascii),
-            "café\r".as_bytes()
+            non_ascii,
+            [
+                "send-keys",
+                "-t",
+                "%9",
+                "-l",
+                "café",
+                ";",
+                "send-keys",
+                "-t",
+                "%9",
+                "Enter",
+            ]
         );
+    }
+
+    #[test]
+    fn send_keys_empty_text_sends_only_named_enter() {
+        let command = send_keys_literal_submit_command("%9", "\r\n");
+        assert_eq!(command, ["send-keys", "-t", "%9", "Enter"]);
     }
 
     #[test]
@@ -1571,13 +1615,13 @@ mod tmux_tests {
     }
 
     #[test]
-    fn send_keys_sends_literal_payload_with_carriage_return_submit() {
-        let iso = IsolatedTmux::new("tmux-send-keys-literal-cr");
+    fn send_keys_sends_literal_payload_with_named_enter_submit() {
+        let iso = IsolatedTmux::new("tmux-send-keys-literal-enter");
         let pane = iso
-            .new_session("sess-literal-cr", Path::new("/tmp"))
+            .new_session("sess-literal-enter", Path::new("/tmp"))
             .unwrap();
         let output = std::env::temp_dir().join(format!(
-            "tmux-send-keys-literal-cr-{}-{}.bin",
+            "tmux-send-keys-literal-enter-{}-{}.bin",
             std::process::id(),
             std::thread::current().name().unwrap_or("anon")
         ));
