@@ -18,7 +18,7 @@ Tmux server handle. Supports both the default server and isolated test servers.
 | `send_keys(pane, text)` | Send literal text plus named `Enter` in one tmux invocation |
 | `select_pane(pane)` | Focus a pane |
 | `join_pane(src, dst, flag)` | Move pane to another window |
-| `break_pane(pane)` | Break pane into new window |
+| `break_pane(pane)` | Move pane into a new window without raw `break-pane` |
 | `stash_pane(pane, session)` | Move pane to stash window |
 | `auto_start(session, cwd)` | Create session/window as needed |
 | `attach_control_mode(target)` | Attach a long-lived `tmux -C` client for event-driven output and lifecycle notifications |

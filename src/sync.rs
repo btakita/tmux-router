@@ -25,7 +25,8 @@
 //!   This order prevents tmux from auto-selecting an unintended pane when
 //!   stashing occurs.
 //! - A 1-in/1-out replacement uses an atomic `swap-pane` fast path to avoid
-//!   visual flicker.
+//!   visual flicker unless the incoming pane is currently parked in a stash
+//!   window; stash-origin panes reattach through the normal attach/detach path.
 //! - After layout stabilises, `equalize_sizes` distributes pane space evenly
 //!   (50/50 for 2 columns, `even-horizontal` for 3+, percentage-split per column).
 //! - `stash_overflow_panes` removes trailing panes (column-last, non-focus) when
@@ -66,6 +67,7 @@
 //!
 //! - `fast_path`: layout already matches desired order → zero mutations, returns immediately
 //! - `swap_atomic`: exactly one pane in, one pane out → `swap-pane` used, no join/stash cycle
+//! - `stash_origin_no_swap`: stashed incoming pane skips `swap-pane` and reattaches by join/stash
 //! - `attach_detach_order`: missing panes joined before unwanted panes stashed → focus pane never loses selection during stash
 //! - `reorder`: correct panes present but wrong order → break + rejoin restores desired order
 //! - `cross_session_blocked`: `--window` in session B while wanted panes are in session A → window arg silently ignored, session A used
@@ -315,6 +317,24 @@ impl<'a> SessionScope<'a> {
             }
         }
         ok
+    }
+}
+
+fn pane_in_stash_window(tmux: &Tmux, pane: &str, session_name: Option<&str>) -> bool {
+    let window = match tmux.pane_window(pane) {
+        Ok(window) => window,
+        Err(_) => return false,
+    };
+
+    if session_name.is_some_and(|session| tmux.find_all_stash_windows(session).contains(&window)) {
+        return true;
+    }
+
+    match tmux.pane_session(pane) {
+        Ok(actual_session) if session_name != Some(actual_session.as_str()) => tmux
+            .find_all_stash_windows(&actual_session)
+            .contains(&window),
+        _ => false,
     }
 }
 
@@ -1107,6 +1127,14 @@ pub fn reconcile(
                 ),
             );
             return Ok(log);
+        } else if pane_in_stash_window(tmux, incoming, session_name) {
+            log.log(
+                "SWAP",
+                format!(
+                    "skipped swap-pane for stashed incoming {}; using attach/detach",
+                    incoming
+                ),
+            );
         } else {
             // Only swap if the incoming pane is alive and SessionScope allows it
             if tmux.pane_window(incoming).is_ok() {
@@ -3846,7 +3874,11 @@ mod tests {
         )
         .unwrap();
         let before = t.list_window_panes(&target_window).unwrap();
-        assert_eq!(before.len(), 2, "start layout should be 2 panes: {before:?}");
+        assert_eq!(
+            before.len(),
+            2,
+            "start layout should be 2 panes: {before:?}"
+        );
 
         // Now navigate to B (incoming) which would displace A (outgoing) — but A
         // is protected/busy. desired = [[B], [C]].
@@ -3894,6 +3926,159 @@ mod tests {
             "expected preserved-layout log entry: {:?}",
             log.entries()
         );
+    }
+
+    #[test]
+    fn test_reconcile_stashed_incoming_skips_swap_fast_path() {
+        // Stash-origin panes must not use tmux swap-pane to enter the visible
+        // agent-doc window. They reattach through ATTACH, then the outgoing pane
+        // is stashed normally.
+        let t = IsolatedTmux::new("sync-test-stashed-incoming-no-swap");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-x", "200", "-y", "60"]);
+        let pane_b = t.new_window("test", tmp.path()).unwrap();
+        let pane_c = t.new_window("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+
+        t.join_pane(&pane_c, &pane_a, "-dh").unwrap();
+        t.stash_pane(&pane_b, "test").unwrap();
+
+        let stash_window = t.find_stash_window("test").unwrap();
+        let stash_before = t.list_window_panes(&stash_window).unwrap();
+        assert!(
+            stash_before.contains(&pane_b),
+            "incoming B should start in stash: {stash_before:?}"
+        );
+
+        let before = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(
+            before.len(),
+            2,
+            "start layout should be 2 panes: {before:?}"
+        );
+        assert!(
+            before.contains(&pane_a),
+            "A should start visible: {before:?}"
+        );
+        assert!(
+            before.contains(&pane_c),
+            "C should start visible: {before:?}"
+        );
+
+        let cols = vec![vec![pane_b.clone()], vec![pane_c.clone()]];
+        let desired: Vec<&str> = vec![pane_b.as_str(), pane_c.as_str()];
+        let log = reconcile(
+            &t,
+            &target_window,
+            &cols,
+            &desired,
+            Some("test"),
+            Some(&pane_b),
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
+
+        assert!(!log.has_errors(), "reconcile errors: {:?}", log.entries());
+        assert!(
+            log.entries().iter().any(|e| {
+                e.phase == "SWAP"
+                    && e.message.contains("stashed incoming")
+                    && e.message.contains(&pane_b)
+            }),
+            "expected stashed-incoming SWAP skip: {:?}",
+            log.entries()
+        );
+        assert!(
+            !log.entries()
+                .iter()
+                .any(|e| e.phase == "SWAP" && e.ok && e.message.contains("atomic")),
+            "stashed incoming must not use swap-pane: {:?}",
+            log.entries()
+        );
+
+        let after = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(after.len(), 2, "final layout should be 2 panes: {after:?}");
+        assert!(after.contains(&pane_b), "B should be visible: {after:?}");
+        assert!(
+            after.contains(&pane_c),
+            "C should remain visible: {after:?}"
+        );
+        assert!(!after.contains(&pane_a), "A should be displaced: {after:?}");
+        assert!(t.pane_alive(&pane_a), "A should still be alive in stash");
+    }
+
+    #[test]
+    fn test_reconcile_cross_session_stashed_incoming_skips_swap_fast_path() {
+        // If a registered pane drifted into another session's stash, it still
+        // must reattach via join-pane instead of the swap fast path.
+        let t = IsolatedTmux::new("sync-test-cross-session-stash-no-swap");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("target", tmp.path()).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-x", "200", "-y", "60"]);
+        let pane_c = t.new_window("target", tmp.path()).unwrap();
+        let pane_b = t.new_session("source", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+
+        t.join_pane(&pane_c, &pane_a, "-dh").unwrap();
+        t.stash_pane(&pane_b, "source").unwrap();
+
+        let source_stash = t.find_stash_window("source").unwrap();
+        let source_stash_before = t.list_window_panes(&source_stash).unwrap();
+        assert!(
+            source_stash_before.contains(&pane_b),
+            "incoming B should start in source stash: {source_stash_before:?}"
+        );
+
+        let cols = vec![vec![pane_b.clone()], vec![pane_c.clone()]];
+        let desired: Vec<&str> = vec![pane_b.as_str(), pane_c.as_str()];
+        let log = reconcile(
+            &t,
+            &target_window,
+            &cols,
+            &desired,
+            Some("target"),
+            Some(&pane_b),
+            &dummy_registry_path(),
+            &SyncOptions::default(),
+        )
+        .unwrap();
+
+        assert!(!log.has_errors(), "reconcile errors: {:?}", log.entries());
+        assert!(
+            log.entries().iter().any(|e| {
+                e.phase == "SWAP"
+                    && e.message.contains("stashed incoming")
+                    && e.message.contains(&pane_b)
+            }),
+            "expected cross-session stashed-incoming SWAP skip: {:?}",
+            log.entries()
+        );
+        assert!(
+            !log.entries()
+                .iter()
+                .any(|e| e.phase == "SWAP" && e.ok && e.message.contains("atomic")),
+            "cross-session stashed incoming must not use swap-pane: {:?}",
+            log.entries()
+        );
+
+        let after = t.list_window_panes(&target_window).unwrap();
+        assert_eq!(after.len(), 2, "final layout should be 2 panes: {after:?}");
+        assert!(after.contains(&pane_b), "B should be visible: {after:?}");
+        assert!(
+            after.contains(&pane_c),
+            "C should remain visible: {after:?}"
+        );
+        assert!(!after.contains(&pane_a), "A should be displaced: {after:?}");
+        assert_eq!(
+            t.pane_session(&pane_b).unwrap(),
+            "target",
+            "cross-session join should move B into target session"
+        );
+        assert!(t.pane_alive(&pane_a), "A should still be alive in stash");
     }
 
     #[test]
@@ -4763,7 +4948,7 @@ mod tests {
             "-y",
             "60",
         ]);
-        let pane_x = t
+        let _pane_x = t
             .raw_cmd(&[
                 "split-window",
                 "-t",
@@ -4834,7 +5019,7 @@ mod tests {
             "-y",
             "60",
         ]);
-        let pane_x = t
+        let _pane_x = t
             .raw_cmd(&[
                 "split-window",
                 "-t",
@@ -4898,7 +5083,7 @@ mod tests {
             "-y",
             "60",
         ]);
-        let pane_x = t
+        let _pane_x = t
             .raw_cmd(&[
                 "split-window",
                 "-t",
@@ -5308,7 +5493,7 @@ mod tests {
             }
         };
 
-        let result = sync(
+        let _result = sync(
             &col_args,
             Some(&target_window),
             None,

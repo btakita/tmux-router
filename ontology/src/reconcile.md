@@ -14,14 +14,14 @@ The attach-before-detach order is intentional: tmux auto-selects a pane when the
 
 ## [Axiology](../../../existence-lang/ontology/src/axiology.md)
 
-Reconcile is the core intelligence of tmux-router. It closes the gap between declarative intent ([layout](./layout.md)) and live tmux state, minimising disruption: panes are reused rather than killed, focus is preserved, and a 1-in/1-out replacement uses an atomic `swap-pane` fast path to eliminate visual flicker. Errors during any phase are logged to `SyncLog` but do not abort the run, so a partially-degraded layout is always preferred over a crash.
+Reconcile is the core intelligence of tmux-router. It closes the gap between declarative intent ([layout](./layout.md)) and live tmux state, minimising disruption: panes are reused rather than killed, focus is preserved, and ordinary 1-in/1-out replacements can use an atomic `swap-pane` fast path to eliminate visual flicker. Stashed incoming panes use attach/detach instead. Errors during any phase are logged to `SyncLog` but do not abort the run, so a partially-degraded layout is always preferred over a crash.
 
 ## [Epistemology](../../../existence-lang/ontology/src/epistemology.md)
 
 ### [Pattern](../../../existence-lang/ontology/src/pattern.md) Expression
 
 - **Resolution tiers**: (1) [registry](./registry.md) lookup by file path, (2) in-memory donor from the same column, (3) spare unassigned pane in the target window.
-- **Fast path**: when exactly one pane is entering and one is leaving, `swap-pane` is used atomically — no join/break round-trip.
+- **Fast path**: when exactly one non-stash pane is entering and one pane is leaving, `swap-pane` is used atomically. If the incoming pane is parked in the stash, reconcile skips `swap-pane` and uses attach/detach instead.
 - **Scope guard**: every `join_pane` / `swap_pane` call passes through `SessionScope`; out-of-scope moves return `Ok(false)` and are skipped.
 - **Observability**: `SyncLog` records each phase operation with pass/fail. `has_errors()` lets callers detect partial failure without panicking.
 - **Post-condition**: `verify_boundary` confirms all panes in the target window belong to the target session; violations are logged as `SCOPE_VIOLATION`.

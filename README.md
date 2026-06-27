@@ -180,7 +180,7 @@ let output = control.wait_for_pane_output(
 ## Architecture
 
 - **Registry** (`.tmux-router/registry.json`) — maps file paths to pane IDs
-- **Layout reconciliation** — attach-first algorithm (ATTACH → SELECT → DETACH → REORDER → VERIFY)
+- **Layout reconciliation** — attach-first algorithm (ATTACH → SELECT → DETACH → REORDER → VERIFY), with `swap-pane` reserved for non-stash 1-in/1-out replacements
 - **Stash window** — evicted panes collected in one place, not scattered; early-exit paths stash excess panes to prevent leftovers from previous layouts
 - **Health management** — dead panes pruned, stale bindings cleaned up
 - **Control-mode events** — long-lived `tmux -C` readers expose pane output and lifecycle notifications for event-driven monitors

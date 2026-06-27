@@ -15,7 +15,7 @@ The sync algorithm arranges tmux panes to match a declarative column layout.
 2. **Auto-register** — Unresolved files share a pane with another file in the same column (ephemeral, not persisted)
 3. **Build columns** — Group resolved panes into the column structure
 4. **Pick target window** — Find the window containing the most desired panes
-5. **Reconcile** — Attach-first algorithm: join missing panes, then evict unwanted ones
+5. **Reconcile** — Attach-first algorithm: join missing panes, then evict unwanted ones; non-stash 1-in/1-out replacements may use `swap-pane`
 6. **Equalize** — Resize panes for even distribution
 
 ## Reconciliation: Attach-First
@@ -23,6 +23,7 @@ The sync algorithm arranges tmux panes to match a declarative column layout.
 ```text
 SNAPSHOT — query current panes in target window
 FAST PATH — if layout already correct, done
+SWAP     — for ordinary 1-in/1-out replacements only; stashed incoming panes skip this
 ATTACH   — join missing desired panes (all with -d flag, no focus change)
 SELECT   — select the focus pane
 DETACH   — stash unwanted panes (focus survives, no selection jump)

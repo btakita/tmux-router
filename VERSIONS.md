@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.12 (2026-06-27)
+
+- **Stash-origin pane replacement avoids `swap-pane`.** A 1-in/1-out reconcile still uses the atomic `swap-pane` fast path for ordinary panes, but if the incoming pane is parked in a `stash`/`stash-*` window it now skips `swap-pane` and reattaches through ATTACH/DETACH. This avoids the tmux crash path reported when panes move from the stash window back into the visible agent-doc window.
+- **`break_pane` no longer calls tmux `break-pane`.** `Tmux::break_pane()` now emulates the move with a detached temporary window, `join-pane`, and placeholder cleanup. This avoids tmux 3.7 server exits while preserving the same-session new-window behavior callers expect.
 - **Default submit uses named Enter again.** `Tmux::send_keys()` now keeps the one-process submit boundary but types the payload with `send-keys -l` and submits with a separate named `Enter` tmux command in the same invocation. The default helper no longer sends a hex payload ending in carriage return; the Kitty Return helper remains the explicit enhanced-keyboard fallback.
 - **Standalone CI no longer requires sibling dev checkouts.** Removed unused `existence` and `module-harness` dev-dependencies so `cargo clippy` and `cargo test` work in the standalone `tmux-router` repository checkout used by GitHub Actions.
 - **Protected outgoing on a 1-in/1-out reconcile preserves layout (`#jb-nav-3pane-promote-swap`).** When the SWAP fast path detects exactly one pane to attach and one to detach but the outgoing pane is protected (busy / `protect_pane`), `reconcile` no longer falls through to ATTACH-the-incoming while DETACH skips the busy outgoing pane — that grew the window to N+1 panes (the "3 panes for a 2-column editor" navigation regression). It now preserves the current layout, leaves the incoming pane stashed, and defers so the caller's retry resurfaces it once the pane frees.

@@ -31,8 +31,9 @@
 //!   (`-h`/`-v`, `-d`) and returns the new pane ID.
 //! - `join_pane(src, dst, split_flag)` — moves `src` into `dst`'s window.
 //! - `swap_pane(src, dst)` — atomically swaps two panes without focus change (`-d`).
-//! - `break_pane(pane_id)` — breaks a pane into a new detached window in the
-//!   pane's existing tmux session.
+//! - `break_pane(pane_id)` — moves a pane into a new detached window in the
+//!   pane's existing tmux session without using tmux's crash-prone `break-pane`
+//!   primitive.
 //! - `kill_pane(pane_id)` — kills a pane; refuses (returns `Err`) if it is the sole
 //!   pane in the sole window of its session to prevent accidental session destruction.
 //! - `session_window_count(session)` — counts windows in a session.
@@ -117,8 +118,8 @@
 //!   and returns a non-empty pane ID.
 //! - `auto_start_creates_window`: with an existing session, `auto_start` adds a window
 //!   rather than a new session.
-//! - `break_pane_preserves_source_session`: breaking a pane while another tmux session is
-//!   current still creates the new window in the source pane's original session.
+//! - `break_pane_preserves_source_session`: moving a pane into a new window while
+//!   another tmux session is current still creates the new window in the source pane's original session.
 //! - `stash_pane_fallback`: when `join_pane` fails (pane too small), `stash_pane`
 //!   calls `break_pane_to_stash` and names the overflow window "stash".
 //! - `isolated_tmux_cleanup`: dropping `IsolatedTmux` kills the server; subsequent
@@ -421,20 +422,48 @@ impl Tmux {
         Ok(())
     }
 
-    /// Break a pane out of its window into a new window in the same session.
+    /// Move a pane out of its window into a new window in the same session.
     pub fn break_pane(&self, pane_id: &str) -> Result<()> {
         let session_name = self
             .pane_session(pane_id)
             .with_context(|| format!("failed to resolve tmux session for pane {}", pane_id))?;
         let target = format!("{}:", session_name);
-        let status = self
+        let output = self
             .cmd()
-            .args(["break-pane", "-s", pane_id, "-t", &target, "-d"])
-            .status()
-            .context("failed to run tmux break-pane")?;
-        if !status.success() {
-            anyhow::bail!("tmux break-pane failed for {}", pane_id);
+            .args(["new-window", "-d", "-t", &target, "-P", "-F", "#{pane_id}"])
+            .output()
+            .context("failed to create temporary break-pane window")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux new-window for break_pane failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
+        let placeholder = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if placeholder.is_empty() {
+            anyhow::bail!("tmux new-window for break_pane returned no placeholder pane");
+        }
+
+        if let Err(join_err) = self.join_pane(pane_id, &placeholder, "-dh") {
+            let cleanup = self.kill_pane(&placeholder);
+            if let Err(cleanup_err) = cleanup {
+                anyhow::bail!(
+                    "failed to emulate break_pane for {}: {}; cleanup of temporary pane {} also failed: {}",
+                    pane_id,
+                    join_err,
+                    placeholder,
+                    cleanup_err
+                );
+            }
+            return Err(join_err)
+                .with_context(|| format!("failed to emulate break_pane for {}", pane_id));
+        }
+        self.kill_pane(&placeholder).with_context(|| {
+            format!(
+                "failed to remove temporary break-pane placeholder {}",
+                placeholder
+            )
+        })?;
         Ok(())
     }
 
@@ -957,11 +986,11 @@ impl Tmux {
             .map(|(id, _)| id)
     }
 
-    /// Break a pane out and name the new window "stash" so it's tracked
+    /// Move a pane out and name the new window "stash" so it's tracked
     /// as part of the stash inventory. Used as fallback when join-pane
     /// to the primary stash window fails (pane too small).
     pub fn break_pane_to_stash(&self, pane_id: &str, _session_name: &str) -> Result<()> {
-        // break-pane -d creates a new detached window
+        // break_pane creates a new detached window without using raw tmux break-pane.
         self.break_pane(pane_id)?;
         // Find the window that now contains this pane and rename it to "stash"
         if let Ok(window_id) = self.pane_window(pane_id) {
