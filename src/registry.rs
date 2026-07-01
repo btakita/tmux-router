@@ -140,6 +140,85 @@ pub struct RegistryEntry {
 
 pub type Registry = HashMap<String, RegistryEntry>;
 
+fn canonical_registry_key_in(base_dir: &Path, file: &str) -> String {
+    let path = Path::new(file);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
+    };
+    canonicalize_or_normalize(&joined)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn canonicalize_or_normalize(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| normalize_path_components(path))
+}
+
+fn normalize_path_components(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+/// Return the stable session identifier for a registry entry.
+///
+/// Legacy entries used the map key as the session ID and left `session_id`
+/// empty in the value.
+pub fn entry_session_id<'a>(registry_key: &'a str, entry: &'a RegistryEntry) -> &'a str {
+    if entry.session_id.is_empty() {
+        registry_key
+    } else {
+        entry.session_id.as_str()
+    }
+}
+
+fn choose_preferred_entry(left: &RegistryEntry, right: &RegistryEntry) -> bool {
+    if right.session_id.is_empty() != left.session_id.is_empty() {
+        return !right.session_id.is_empty();
+    }
+    right.started >= left.started
+}
+
+/// Normalize registry keys to canonical file paths and backfill legacy session IDs.
+pub fn normalize_registry(base_dir: &Path, registry: Registry) -> Registry {
+    let mut normalized = Registry::new();
+    for (legacy_key, mut entry) in registry {
+        if entry.session_id.is_empty() {
+            entry.session_id = legacy_key.clone();
+        }
+        let file_hint = if !entry.file.is_empty() {
+            entry.file.clone()
+        } else {
+            legacy_key.clone()
+        };
+        let normalized_key = canonical_registry_key_in(base_dir, &file_hint);
+        if let Some(existing) = normalized.get(&normalized_key)
+            && !choose_preferred_entry(existing, &entry)
+        {
+            continue;
+        }
+        normalized.insert(normalized_key, entry);
+    }
+    normalized
+}
+
+/// Find the map key for a session ID, including legacy key-as-session entries.
+pub fn find_registry_key_by_session_id(registry: &Registry, session_id: &str) -> Option<String> {
+    registry
+        .iter()
+        .find_map(|(key, entry)| (entry_session_id(key, entry) == session_id).then(|| key.clone()))
+}
+
 /// Load the registry from disk. Returns empty map if file doesn't exist.
 pub fn load_registry(path: &Path) -> Result<Registry> {
     if !path.exists() {
@@ -262,6 +341,77 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let reg_path = dir.path().join("registry.json");
         (dir, reg_path)
+    }
+
+    fn registry_entry(started: &str, session_id: &str, file: &str) -> RegistryEntry {
+        RegistryEntry {
+            pane: "%1".to_string(),
+            pid: 1234,
+            cwd: "/tmp".to_string(),
+            started: started.to_string(),
+            session_id: session_id.to_string(),
+            file: file.to_string(),
+            window: "@1".to_string(),
+            supervisor_instance_id: String::new(),
+        }
+    }
+
+    #[test]
+    fn canonical_registry_key_normalizes_missing_relative_paths() {
+        let dir = TempDir::new().unwrap();
+
+        let key = canonical_registry_key_in(dir.path(), "./nested/../doc.md");
+
+        assert_eq!(key, dir.path().join("doc.md").to_string_lossy());
+    }
+
+    #[test]
+    fn normalize_registry_uses_file_hint_and_prefers_latest_duplicate() {
+        let dir = TempDir::new().unwrap();
+        let mut registry = Registry::new();
+        registry.insert(
+            "old-session".to_string(),
+            registry_entry("2026-01-01T00:00:00Z", "", "nested/../plan.md"),
+        );
+        registry.insert(
+            "modern-key".to_string(),
+            registry_entry("2026-01-01T00:01:00Z", "modern-session", "plan.md"),
+        );
+
+        let normalized = normalize_registry(dir.path(), registry);
+        let key = canonical_registry_key_in(dir.path(), "plan.md");
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[&key].session_id, "modern-session");
+    }
+
+    #[test]
+    fn normalize_registry_backfills_legacy_session_id_from_key() {
+        let dir = TempDir::new().unwrap();
+        let mut registry = Registry::new();
+        registry.insert(
+            "legacy-session".to_string(),
+            registry_entry("2026-01-01T00:00:00Z", "", ""),
+        );
+
+        let normalized = normalize_registry(dir.path(), registry);
+        let key = canonical_registry_key_in(dir.path(), "legacy-session");
+
+        assert_eq!(normalized[&key].session_id, "legacy-session");
+    }
+
+    #[test]
+    fn find_registry_key_by_session_id_accepts_legacy_key_fallback() {
+        let mut registry = Registry::new();
+        registry.insert(
+            "legacy-session".to_string(),
+            registry_entry("2026-01-01T00:00:00Z", "", ""),
+        );
+
+        assert_eq!(
+            find_registry_key_by_session_id(&registry, "legacy-session").as_deref(),
+            Some("legacy-session")
+        );
     }
 
     #[test]
