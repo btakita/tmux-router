@@ -499,6 +499,25 @@ pub struct SyncOptions<'a> {
     /// Returns `true` to allow ephemeral assignment, `false` to keep the file
     /// unresolved for this sync cycle.
     pub allow_unresolved_pane_assignment: Option<&'a dyn Fn(&Path) -> bool>,
+    /// When `true`, this is a passive editor-driven sync (SafePassive: the 5s
+    /// layout poll or an editor tab-selection). Passive syncs reconcile layout
+    /// but must NOT steal the tmux active pane when the document pane is already
+    /// placed: the operator may be typing in a different pane, and re-selecting
+    /// the document pane on every poll disrupts them (#panefocussteal). Explicit
+    /// user actions (Claim, manual Sync/Focus, Run Agent Doc) leave this `false`
+    /// so they still bring the requested pane into focus.
+    pub passive: bool,
+}
+
+/// Whether a sync should reselect (focus) the document's pane.
+///
+/// A passive editor-driven sync (poll / tab-selection) must not steal the tmux
+/// active pane when the document pane is already placed in the target window —
+/// the operator may be typing in a different pane and re-selecting on every poll
+/// disrupts them (#panefocussteal). Explicit (non-passive) syncs always reselect
+/// so Claim / manual focus / Run bring the requested pane into view.
+pub(crate) fn should_reselect_focus(passive: bool, focus_pane_already_placed: bool) -> bool {
+    !(passive && focus_pane_already_placed)
 }
 
 /// Sync editor layout to tmux panes.
@@ -996,7 +1015,22 @@ pub fn sync_with_options(
     if let Some(ref fp) = focus_pane
         && tmux.pane_alive(fp)
     {
-        tmux.select_pane(fp)?;
+        // A passive editor sync must not steal the operator's active pane when
+        // the document pane is already placed in the target window. select_pane
+        // batches select-window + select-pane, so an unconditional reselect on
+        // every 5s poll yanks focus away from a tmux pane the operator is typing
+        // in (#panefocussteal).
+        let focus_pane_already_placed = tmux
+            .list_window_panes(&target_window)
+            .map(|panes| panes.iter().any(|p| p == fp))
+            .unwrap_or(false);
+        if should_reselect_focus(options.passive, focus_pane_already_placed) {
+            tmux.select_pane(fp)?;
+        } else {
+            eprintln!(
+                "[sync] passive sync: leaving operator's active pane (document pane {fp} already placed)"
+            );
+        }
     }
     let sel = target_session
         .as_deref()
@@ -1659,6 +1693,22 @@ mod tests {
     use super::*;
     use crate::tmux::IsolatedTmux;
     use tempfile::TempDir;
+
+    // --- Focus reselect (#panefocussteal) ---
+
+    #[test]
+    fn passive_sync_does_not_steal_focus_when_pane_already_placed() {
+        // The operator is typing in a different tmux pane; a passive editor poll
+        // fires with the document pane already placed. It must NOT reselect
+        // (which would steal the active pane).
+        assert!(!should_reselect_focus(true, true));
+        // Passive but the document pane isn't placed yet → bring it into view.
+        assert!(should_reselect_focus(true, false));
+        // Explicit (Claim / manual focus / Run) always reselects the requested
+        // pane, whether or not it is already placed.
+        assert!(should_reselect_focus(false, true));
+        assert!(should_reselect_focus(false, false));
+    }
 
     // --- Layout parsing unit tests ---
 
@@ -5588,6 +5638,7 @@ mod tests {
         let options = SyncOptions {
             protect_pane: None,
             allow_unresolved_pane_assignment: Some(&allow_unresolved_pane_assignment),
+            passive: false,
         };
 
         let result = sync_with_options(
