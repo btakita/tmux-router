@@ -140,7 +140,7 @@ pub struct RegistryEntry {
 
 pub type Registry = HashMap<String, RegistryEntry>;
 
-fn canonical_registry_key_in(base_dir: &Path, file: &str) -> String {
+pub fn canonical_registry_key_in(base_dir: &Path, file: &str) -> String {
     let path = Path::new(file);
     let joined = if path.is_absolute() {
         path.to_path_buf()
