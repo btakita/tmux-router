@@ -974,6 +974,22 @@ pub fn sync_with_options(
         );
     }
 
+    // `#panefocussteal`: capture the operator's active pane before Phase 5 begins
+    // mutating tmux selection. A passive sync (the 5s layout poll or a tab-select)
+    // reconciles + equalizes + overflow-stashes + reselects, and each of those can
+    // move the active pane/window — notably overflow-stash auto-selecting a
+    // neighbor pane. reconcile restores focus internally, but those later phases
+    // re-steal it, so we restore once more at the very end. Explicit (non-passive)
+    // syncs leave this None and still bring the document pane into view.
+    let operator_focus_restore: Option<String> = if options.passive {
+        target_session
+            .as_deref()
+            .and_then(|s| tmux.active_pane(s))
+            .filter(|pane| !pane.is_empty())
+    } else {
+        None
+    };
+
     // --- Phase 5: Reconcile (attach-first: attach -> select -> detach) ---
     {
         use std::io::Write;
@@ -991,7 +1007,7 @@ pub fn sync_with_options(
             let _ = writeln!(f, "  pre-reconcile panes: {:?}", pre);
         }
     }
-    let log = reconcile(
+    let mut log = reconcile(
         tmux,
         &target_window,
         &pane_columns,
@@ -1068,6 +1084,18 @@ pub fn sync_with_options(
         .and_then(|s| tmux.active_pane(s))
         .unwrap_or_default();
     eprintln!("phase6: focus={:?}, selected={}", focus_pane, sel);
+
+    // `#panefocussteal`: after all of Phase 6 (equalize + overflow-stash +
+    // reselect), restore the operator's pre-sync active pane for a passive sync so
+    // they stay on whatever pane/window they were using. No-op for explicit syncs
+    // (operator_focus_restore is None) and when the captured pane died / is now
+    // stashed out of view.
+    restore_operator_focus(
+        tmux,
+        target_session.as_deref(),
+        &operator_focus_restore,
+        &mut log,
+    );
 
     // Log global tmux state at sync end
     global_log.log_global_state(tmux, "sync-end");
@@ -5207,6 +5235,94 @@ mod tests {
             t.active_pane("test").as_deref(),
             Some(pane_a.as_str()),
             "explicit reconcile must focus the document pane"
+        );
+    }
+
+    #[test]
+    fn passive_full_sync_preserves_operator_active_window() {
+        // #panefocussteal end-to-end through the full sync entry (reconcile +
+        // equalize + overflow-stash + reselect). A passive sync must leave the
+        // operator on the pane/window they were using. Reproduces "I was on
+        // window 4 but focus was stolen to the doc pane then to the pane to the
+        // right" — the second hop being overflow-stash auto-selecting a neighbor,
+        // which the reconcile-internal restore alone did not cover.
+        let t = IsolatedTmux::new("sync-test-passive-full-focus");
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Document window: pane_a (registered) + pane_x (unwanted → stashed).
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "50"]);
+        let _pane_x = t
+            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap();
+
+        let file_a = tmp.path().join("registered.md");
+        std::fs::write(&file_a, "# Registered").unwrap();
+        let file_a_str = file_a.to_string_lossy().to_string();
+
+        let registry_path = tmp.path().join("registry.json");
+        let mut registry = crate::registry::Registry::new();
+        registry.insert(
+            "session-aaa".to_string(),
+            crate::registry::RegistryEntry {
+                pane: pane_a.clone(),
+                pid: std::process::id(),
+                cwd: tmp.path().to_string_lossy().to_string(),
+                started: String::new(),
+                session_id: "session-aaa".to_string(),
+                file: file_a_str.clone(),
+                window: target_window.clone(),
+                supervisor_instance_id: String::new(),
+            },
+        );
+        crate::registry::save_registry(&registry_path, &registry).unwrap();
+
+        // Operator's separate work window/pane — make it the active selection.
+        let pane_w = t.new_window("test", tmp.path()).unwrap();
+        let work_window = t.pane_window(&pane_w).unwrap();
+        t.select_pane(&pane_w).unwrap();
+        assert_eq!(
+            t.active_window("test").as_deref(),
+            Some(work_window.as_str()),
+            "precondition: operator is on their work window"
+        );
+
+        let col_args = vec![file_a_str.clone()];
+        let resolve_file = |path: &Path| -> Option<FileResolution> {
+            if path == file_a {
+                Some(FileResolution::Registered {
+                    key: "session-aaa".to_string(),
+                    tmux_session: Some("test".to_string()),
+                })
+            } else {
+                None
+            }
+        };
+
+        let _ = sync_with_options(
+            &col_args,
+            Some(&target_window),
+            Some(file_a_str.as_str()),
+            &t,
+            &registry_path,
+            &resolve_file,
+            &SyncOptions {
+                passive: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            t.active_window("test").as_deref(),
+            Some(work_window.as_str()),
+            "passive full sync must not steal the operator's active window"
+        );
+        assert_eq!(
+            t.active_pane("test").as_deref(),
+            Some(pane_w.as_str()),
+            "passive full sync must restore the operator's active pane"
         );
     }
 
