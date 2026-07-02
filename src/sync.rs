@@ -520,6 +520,37 @@ pub(crate) fn should_reselect_focus(passive: bool, focus_pane_already_placed: bo
     !(passive && focus_pane_already_placed)
 }
 
+/// `#panefocussteal`: restore the operator's pre-reconcile active pane after a
+/// passive editor-driven sync.
+///
+/// The structural reconcile phases select panes (and the target window) to keep
+/// tmux's selection coherent across stash/join churn. On a passive poll or
+/// tab-selection that alone would yank the operator onto the document pane — or
+/// worse, across to the document *window* via the post-detach `select-window` —
+/// even though they were deliberately working in a different pane or window.
+/// Restoring the captured pane makes a passive reconcile focus-neutral. Skips the
+/// restore when the captured pane died or is now stashed out of view (so we never
+/// surface the stash window chasing a stale selection).
+fn restore_operator_focus(
+    tmux: &Tmux,
+    session_name: Option<&str>,
+    operator_pane: &Option<String>,
+    log: &mut SyncLog,
+) {
+    let Some(op) = operator_pane.as_deref() else {
+        return;
+    };
+    if !tmux.pane_alive(op) || pane_in_stash_window(tmux, op, session_name) {
+        return;
+    }
+    if tmux.select_pane(op).is_ok() {
+        log.log(
+            "FOCUS",
+            format!("passive: restored operator pane {op} (no focus steal)"),
+        );
+    }
+}
+
 /// Sync editor layout to tmux panes.
 ///
 /// `col_args` are comma-separated file lists (one per column).
@@ -1119,6 +1150,22 @@ pub fn reconcile(
         return Ok(log);
     }
 
+    // `#panefocussteal`: a passive editor-driven reconcile must be focus-neutral.
+    // The attach/detach/reorder phases below select panes (and re-select the
+    // target window after stashing) to keep tmux's selection sane, but the
+    // operator may be typing in a different pane or working in another window.
+    // Capture their active pane now and restore it once reconcile settles.
+    // Explicit (non-passive) syncs leave this None so Claim / manual Sync / Run
+    // still bring the requested pane into view. The FAST_PATH above already
+    // returned without selecting anything, so no-op polls never reach here.
+    let operator_focus_restore: Option<String> = if options.passive {
+        session_name
+            .and_then(|s| tmux.active_pane(s))
+            .filter(|pane| !pane.is_empty())
+    } else {
+        None
+    };
+
     let current_panes = tmux.list_window_panes(target_window).unwrap_or_default();
     let current_set: HashSet<String> = current_panes.iter().cloned().collect();
 
@@ -1182,6 +1229,7 @@ pub fn reconcile(
                         let _ = tmux.select_pane(select_target);
                         log.log("SELECT", format!("focused {}", select_target));
 
+                        restore_operator_focus(tmux, session_name, &operator_focus_restore, &mut log);
                         return Ok(log);
                     }
                     Ok(false) => {
@@ -1470,6 +1518,10 @@ pub fn reconcile(
     for pane in desired_ordered {
         update_registry(tmux, pane, registry_path, &mut log);
     }
+
+    // `#panefocussteal`: undo the internal SELECT/DETACH-restore churn for a
+    // passive sync so the operator stays on whatever pane/window they were using.
+    restore_operator_focus(tmux, session_name, &operator_focus_restore, &mut log);
 
     Ok(log)
 }
@@ -5048,6 +5100,113 @@ mod tests {
         assert!(
             final_panes.contains(&pane_b),
             "B should be joined from different session"
+        );
+    }
+
+    #[test]
+    fn passive_reconcile_preserves_operator_active_window() {
+        // #panefocussteal: the operator is working in a different tmux window; a
+        // passive editor sync that reconciles the document window (stashing an
+        // unwanted pane, which internally re-selects the target window) must not
+        // yank their focus back. Reproduces "I switch to another tmux pane/window
+        // and get pulled back to the document pane."
+        let t = IsolatedTmux::new("sync-test-passive-focus-preserve");
+        let tmp = TempDir::new().unwrap();
+
+        // Document window: A + X (X is unwanted and will be stashed).
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _pane_x = t
+            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap();
+
+        // Operator's separate work window/pane — make it the active selection.
+        let pane_w = t.new_window("test", tmp.path()).unwrap();
+        let work_window = t.pane_window(&pane_w).unwrap();
+        t.select_pane(&pane_w).unwrap();
+        assert_eq!(
+            t.active_window("test").as_deref(),
+            Some(work_window.as_str()),
+            "precondition: operator is on their work window"
+        );
+
+        // Desired doc layout drops X — a real change, so reconcile skips FAST_PATH
+        // and runs the DETACH/select-window churn that used to steal focus.
+        let pane_columns = vec![vec![pane_a.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str()];
+
+        let _log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            Some("test"),
+            Some(pane_a.as_str()),
+            &dummy_registry_path(),
+            &SyncOptions {
+                passive: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            t.active_window("test").as_deref(),
+            Some(work_window.as_str()),
+            "passive reconcile must not steal the operator's active window"
+        );
+        assert_eq!(
+            t.active_pane("test").as_deref(),
+            Some(pane_w.as_str()),
+            "passive reconcile must restore the operator's active pane"
+        );
+    }
+
+    #[test]
+    fn active_reconcile_still_focuses_document_pane() {
+        // Guard: an explicit (non-passive) sync must still bring the document
+        // pane into view — the #panefocussteal fix only relaxes passive syncs.
+        let t = IsolatedTmux::new("sync-test-active-focus-brings-doc");
+        let tmp = TempDir::new().unwrap();
+
+        let pane_a = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_a).unwrap();
+        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _pane_x = t
+            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .unwrap();
+
+        let pane_w = t.new_window("test", tmp.path()).unwrap();
+        t.select_pane(&pane_w).unwrap();
+
+        let pane_columns = vec![vec![pane_a.clone()]];
+        let desired: Vec<&str> = vec![pane_a.as_str()];
+
+        let _log = reconcile(
+            &t,
+            &target_window,
+            &pane_columns,
+            &desired,
+            Some("test"),
+            Some(pane_a.as_str()),
+            &dummy_registry_path(),
+            &SyncOptions {
+                passive: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            t.active_window("test").as_deref(),
+            Some(target_window.as_str()),
+            "explicit reconcile must focus the document window"
+        );
+        assert_eq!(
+            t.active_pane("test").as_deref(),
+            Some(pane_a.as_str()),
+            "explicit reconcile must focus the document pane"
         );
     }
 
