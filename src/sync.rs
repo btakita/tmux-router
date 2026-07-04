@@ -1257,7 +1257,12 @@ pub fn reconcile(
                         let _ = tmux.select_pane(select_target);
                         log.log("SELECT", format!("focused {}", select_target));
 
-                        restore_operator_focus(tmux, session_name, &operator_focus_restore, &mut log);
+                        restore_operator_focus(
+                            tmux,
+                            session_name,
+                            &operator_focus_restore,
+                            &mut log,
+                        );
                         return Ok(log);
                     }
                     Ok(false) => {
@@ -5144,9 +5149,25 @@ mod tests {
         // Document window: A + X (X is unwanted and will be stashed).
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let _pane_x = t
-            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
 
         // Operator's separate work window/pane — make it the active selection.
@@ -5200,9 +5221,25 @@ mod tests {
 
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "60"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "60",
+        ]);
         let _pane_x = t
-            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
 
         let pane_w = t.new_window("test", tmp.path()).unwrap();
@@ -5252,9 +5289,25 @@ mod tests {
         // Document window: pane_a (registered) + pane_x (unwanted → stashed).
         let pane_a = t.new_session("test", tmp.path()).unwrap();
         let target_window = t.pane_window(&pane_a).unwrap();
-        let _ = t.raw_cmd(&["resize-window", "-t", &target_window, "-x", "200", "-y", "50"]);
+        let _ = t.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &target_window,
+            "-x",
+            "200",
+            "-y",
+            "50",
+        ]);
         let _pane_x = t
-            .raw_cmd(&["split-window", "-t", &pane_a, "-h", "-P", "-F", "#{pane_id}"])
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_a,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
             .unwrap();
 
         let file_a = tmp.path().join("registered.md");
