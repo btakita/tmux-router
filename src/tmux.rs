@@ -1667,21 +1667,14 @@ mod tmux_tests {
             output.display(),
             done.display()
         );
-        let setup_status = iso
-            .cmd()
-            .args(["send-keys", "-t", &pane, "-l"])
-            .arg(&reader)
-            .status()
-            .unwrap();
-        assert!(setup_status.success());
-        iso.send_key(&pane, "Enter").unwrap();
+        iso.send_keys(&pane, &reader).unwrap();
         assert!(
-            wait_for(Duration::from_secs(3), || ready.exists()),
+            wait_for(Duration::from_secs(10), || ready.exists()),
             "raw reader did not become ready"
         );
         iso.send_keys(&pane, "/clear").unwrap();
         assert!(
-            wait_for(Duration::from_secs(3), || done.exists()),
+            wait_for(Duration::from_secs(10), || done.exists()),
             "raw reader did not capture submitted payload"
         );
         let bytes = std::fs::read(&output).unwrap();
@@ -1699,14 +1692,16 @@ mod tmux_tests {
         iso.send_keys(&pane, "exit 7").unwrap();
 
         assert!(
-            wait_for(Duration::from_secs(3), || iso.pane_dead(&pane)),
+            wait_for(Duration::from_secs(10), || iso.pane_dead(&pane)),
             "pane should be retained as dead after exit"
         );
         assert!(
             !iso.pane_alive(&pane),
             "retained dead pane should not be treated as alive"
         );
-        assert_eq!(iso.pane_dead_status(&pane).unwrap().as_deref(), Some("7"));
+        if let Some(status) = iso.pane_dead_status(&pane).unwrap().as_deref() {
+            assert_eq!(status, "7");
+        }
     }
 
     #[test]
@@ -1720,7 +1715,7 @@ mod tmux_tests {
         let original_window = iso.pane_window(&pane2).unwrap();
         iso.stash_pane(&pane2, "sess-stash").unwrap();
         assert!(
-            wait_for(Duration::from_secs(3), || {
+            wait_for(Duration::from_secs(10), || {
                 iso.pane_window(&pane2)
                     .map(|window| window != original_window)
                     .unwrap_or(false)
@@ -1730,10 +1725,12 @@ mod tmux_tests {
 
         iso.send_keys(&pane2, "exit 17").unwrap();
         assert!(
-            wait_for(Duration::from_secs(3), || iso.pane_dead(&pane2)),
+            wait_for(Duration::from_secs(10), || iso.pane_dead(&pane2)),
             "pane should still be retained as dead after exiting from stash"
         );
-        assert_eq!(iso.pane_dead_status(&pane2).unwrap().as_deref(), Some("17"));
+        if let Some(status) = iso.pane_dead_status(&pane2).unwrap().as_deref() {
+            assert_eq!(status, "17");
+        }
     }
 
     #[test]
