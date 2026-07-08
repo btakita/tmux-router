@@ -1,6 +1,6 @@
 [package]
 name = "tmux-router"
-version = "0.3.13"
+version = "0.3.14"
 edition = "2024"
 description = "Declarative tmux pane routing — sync editor layouts to tmux"
 license = "MIT"
@@ -13,6 +13,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fs2 = "0.4"
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 [dev-dependencies]
 proptest = "1"

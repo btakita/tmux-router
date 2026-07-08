@@ -557,7 +557,7 @@ fn restore_operator_focus(
 /// `window` is an optional tmux window ID to use as target.
 /// `focus` is an optional file path to focus after sync.
 /// `tmux` is the tmux server handle.
-/// `registry_path` is the path to the registry JSON file.
+/// `registry_path` is the path to the registry database or compatibility JSON file.
 /// `resolve_file` is a callback that resolves a file path to its registration info.
 pub fn sync(
     col_args: &[String],

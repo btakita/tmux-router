@@ -150,7 +150,7 @@ sync(
     Some("@1"),
     Some("a.md"),
     &tmux,
-    Path::new(".tmux-router/registry.json"),
+    Path::new(".tmux-router/state.db"),
     &|path| {
         Some(FileResolution::Registered {
             key: path.to_string_lossy().to_string(),
@@ -179,7 +179,7 @@ let output = control.wait_for_pane_output(
 
 ## Architecture
 
-- **Registry** (`.tmux-router/registry.json`) — maps file paths to pane IDs
+- **Registry** (`.tmux-router/state.db`) — SQLite database that maps file paths to pane IDs
 - **Layout reconciliation** — attach-first algorithm (ATTACH → SELECT → DETACH → REORDER → VERIFY), with `swap-pane` reserved for non-stash 1-in/1-out replacements
 - **Stash window** — evicted panes collected in one place, not scattered; early-exit paths stash excess panes to prevent leftovers from previous layouts
 - **Health management** — dead panes pruned, stale bindings cleaned up

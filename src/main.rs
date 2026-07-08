@@ -10,8 +10,8 @@ use tmux_router::tmux::Tmux;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Registry file path
-    #[arg(long, default_value = ".tmux-router/registry.json")]
+    /// Registry database path
+    #[arg(long, default_value = ".tmux-router/state.db")]
     registry: PathBuf,
 
     #[command(subcommand)]
