@@ -397,7 +397,10 @@ pub fn prune(registry_path: &Path, tmux: &Tmux) -> Result<usize> {
     let before = registry.len();
 
     // Remove dead panes — single subprocess call instead of N
-    let alive = tmux.alive_pane_ids();
+    // Fail closed: a transient `list-panes` error is not proof that every
+    // registered actor died. Propagate it without saving, preserving all
+    // bindings until a successful liveness snapshot is available.
+    let alive = tmux.try_alive_pane_ids()?;
     registry.retain(|_key, entry| alive.contains(&entry.pane));
     let dead_removed = before - registry.len();
 
@@ -919,6 +922,25 @@ mod tests {
     }
 
     #[test]
+    fn prune_preserves_registry_when_tmux_liveness_snapshot_fails() {
+        let (_dir, reg_path) = setup();
+        let mut registry = Registry::new();
+        registry.insert(
+            "live-session".to_string(),
+            registry_entry("2026-07-16T00:00:00Z", "live-session", "plan.md"),
+        );
+        save_registry(&reg_path, &registry).unwrap();
+        let unavailable = Tmux {
+            server_socket: Some(format!("tmux-router-missing-{}", std::process::id())),
+        };
+
+        assert!(prune(&reg_path, &unavailable).is_err());
+        let retained = load_registry(&reg_path).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert!(retained.contains_key("live-session"));
+    }
+
+    #[test]
     fn canonical_registry_key_normalizes_missing_relative_paths() {
         let dir = TempDir::new().unwrap();
 
@@ -999,7 +1021,7 @@ mod tests {
         let (_dir, reg_path) = setup();
         let _lock = RegistryLock::acquire(&reg_path).unwrap();
         let result = RegistryLock::acquire(&reg_path);
-        let err = result.err().expect("should fail on nested acquire");
+        let err = result.expect_err("should fail on nested acquire");
         assert!(
             err.to_string().contains("already held"),
             "error should mention 'already held', got: {}",

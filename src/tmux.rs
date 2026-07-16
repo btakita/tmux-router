@@ -199,26 +199,38 @@ impl Tmux {
     /// Returns a HashSet for O(1) lookup. Use this instead of calling
     /// `pane_alive()` per entry to avoid N subprocess calls.
     pub fn alive_pane_ids(&self) -> std::collections::HashSet<String> {
-        let output = self
+        self.try_alive_pane_ids().unwrap_or_default()
+    }
+
+    /// Fallible alive-pane snapshot for destructive/reaping callers.
+    ///
+    /// A transient tmux command failure is not evidence that every pane died.
+    /// Reapers must propagate the sampling error and preserve the registry.
+    pub fn try_alive_pane_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let out = self
             .cmd()
             .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
-            .output();
-        match output {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter_map(|line| {
-                    let mut parts = line.splitn(2, '\t');
-                    let pane_id = parts.next()?.trim();
-                    let pane_dead = parts.next().unwrap_or("0").trim();
-                    if pane_id.is_empty() || pane_dead == "1" {
-                        None
-                    } else {
-                        Some(pane_id.to_string())
-                    }
-                })
-                .collect(),
-            _ => std::collections::HashSet::new(),
+            .output()
+            .context("failed to sample tmux panes")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "tmux list-panes failed while sampling liveness: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut parts = line.splitn(2, '\t');
+                let pane_id = parts.next()?.trim();
+                let pane_dead = parts.next().unwrap_or("0").trim();
+                if pane_id.is_empty() || pane_dead == "1" {
+                    None
+                } else {
+                    Some(pane_id.to_string())
+                }
+            })
+            .collect())
     }
 
     /// Check if a tmux server is running (has any sessions).
@@ -1507,6 +1519,14 @@ mod tmux_tests {
             .skip(4)
             .map(|hex| u8::from_str_radix(hex, 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn fallible_alive_snapshot_distinguishes_tmux_failure_from_zero_panes() {
+        let unavailable = Tmux {
+            server_socket: Some(format!("tmux-router-missing-{}", std::process::id())),
+        };
+        assert!(unavailable.try_alive_pane_ids().is_err());
     }
 
     #[test]

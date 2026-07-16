@@ -154,7 +154,7 @@ impl SyncLog {
 
     pub fn log(&mut self, phase: &'static str, message: impl Into<String>) {
         let msg = message.into();
-        eprintln!("[sync:{}] {}", phase, &msg);
+        eprintln!("[sync:{}] {}", phase, msg);
         self.entries.push(SyncEntry {
             phase,
             message: msg,
@@ -164,7 +164,7 @@ impl SyncLog {
 
     pub fn log_err(&mut self, phase: &'static str, message: impl Into<String>) {
         let msg = message.into();
-        eprintln!("[sync:{}] ERROR: {}", phase, &msg);
+        eprintln!("[sync:{}] ERROR: {}", phase, msg);
         self.entries.push(SyncEntry {
             phase,
             message: msg,
