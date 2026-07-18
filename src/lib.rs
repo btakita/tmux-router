@@ -17,4 +17,7 @@ pub use registry::{
     Registry, RegistryEntry, RegistryLock, prune, with_registry, with_registry_val,
 };
 pub use sync::{FileResolution, SyncOptions, SyncResult, sync, sync_with_options};
-pub use tmux::{IsolatedTmux, Tmux, TmuxBatch};
+pub use tmux::{
+    IsolatedTmux, PaneSnapshotScope, Tmux, TmuxBatch, begin_pane_snapshot_scope,
+    invalidate_pane_snapshot,
+};

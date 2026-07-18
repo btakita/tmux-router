@@ -147,6 +147,142 @@ pub struct Tmux {
     pub server_socket: Option<String>,
 }
 
+// `#syncobscache`: command-scoped pane-liveness snapshot.
+//
+// `pane_alive` / `pane_dead` run `list-panes -a` (every pane on the server) and
+// then scan the result for a single id. A caller checking N panes therefore
+// issued N identical full scans — 18 of them in a measured agent-doc focus
+// sync, at ~20ms per subprocess, which dominated the lag between switching a
+// file in the editor and tmux focus following.
+//
+// A reconciliation pass wants one coherent view of pane liveness anyway, so
+// inside an explicitly-opened scope the snapshot is taken once and shared.
+// Safety properties mirror the agent-doc side: it is opt-in (nothing caches
+// without a scope, so poll loops are unaffected), it is dropped with the guard,
+// and any pane-mutating operation must invalidate it via
+// `invalidate_pane_snapshot`.
+thread_local! {
+    static PANE_SNAPSHOT_SCOPE: std::cell::RefCell<Option<PaneSnapshotScopeState>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[derive(Default)]
+struct PaneSnapshotScopeState {
+    snapshot: Option<String>,
+    depth: usize,
+}
+
+/// RAII guard for a pane-liveness observation scope on this thread.
+#[must_use = "the pane snapshot is cached only while the guard is alive"]
+pub struct PaneSnapshotScope {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+/// Open a command-scoped pane-liveness cache. Nested calls are reference
+/// counted, so an inner scope does not discard the outer snapshot.
+pub fn begin_pane_snapshot_scope() -> PaneSnapshotScope {
+    PANE_SNAPSHOT_SCOPE.with(|scope| {
+        let mut scope = scope.borrow_mut();
+        match scope.as_mut() {
+            Some(state) => state.depth += 1,
+            None => {
+                *scope = Some(PaneSnapshotScopeState {
+                    snapshot: None,
+                    depth: 1,
+                })
+            }
+        }
+    });
+    PaneSnapshotScope {
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+/// Drop any cached pane snapshot. Call after an operation that can create,
+/// kill, or move panes so a stale liveness answer is never served.
+pub fn invalidate_pane_snapshot() {
+    PANE_SNAPSHOT_SCOPE.with(|scope| {
+        if let Some(state) = scope.borrow_mut().as_mut() {
+            state.snapshot = None;
+        }
+    });
+}
+
+impl Drop for PaneSnapshotScope {
+    fn drop(&mut self) {
+        PANE_SNAPSHOT_SCOPE.with(|scope| {
+            let mut scope = scope.borrow_mut();
+            let finished = match scope.as_mut() {
+                Some(state) => {
+                    state.depth -= 1;
+                    state.depth == 0
+                }
+                None => false,
+            };
+            if finished {
+                *scope = None;
+            }
+        });
+    }
+}
+
+fn scope_is_active() -> bool {
+    PANE_SNAPSHOT_SCOPE.with(|scope| scope.borrow().is_some())
+}
+
+fn remember_pane_dead_snapshot(raw: &str) {
+    PANE_SNAPSHOT_SCOPE.with(|scope| {
+        if let Some(state) = scope.borrow_mut().as_mut() {
+            state.snapshot = Some(raw.to_string());
+        }
+    });
+}
+
+/// The scope's pane snapshot, sampling it once on first use. `None` when no
+/// scope is active, so the caller keeps its normal uncached path.
+fn cached_pane_dead_snapshot(tmux: &Tmux) -> Option<String> {
+    if !scope_is_active() {
+        return None;
+    }
+    if let Some(cached) =
+        PANE_SNAPSHOT_SCOPE.with(|scope| scope.borrow().as_ref().and_then(|s| s.snapshot.clone()))
+    {
+        return Some(cached);
+    }
+    let raw = tmux.pane_dead_snapshot_uncached()?;
+    remember_pane_dead_snapshot(&raw);
+    Some(raw)
+}
+
+/// Parse one pane's `pane_dead` flag out of a raw snapshot.
+fn parse_pane_dead_flag(raw: &str, pane_id: &str) -> Option<bool> {
+    for line in raw.lines() {
+        let mut parts = line.splitn(2, '\t');
+        let id = parts.next()?;
+        if id.trim() != pane_id {
+            continue;
+        }
+        return Some(parts.next().unwrap_or("0").trim() == "1");
+    }
+    None
+}
+
+/// Parse the alive (non-dead) pane ids out of a raw snapshot.
+fn parse_alive_pane_ids(raw: &str) -> std::collections::HashSet<String> {
+    raw.lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let pane_id = parts.next()?.trim();
+            let pane_dead = parts.next().unwrap_or("0").trim();
+            if pane_id.is_empty() || pane_dead == "1" {
+                None
+            } else {
+                Some(pane_id.to_string())
+            }
+        })
+        .collect()
+}
+
 impl Tmux {
     /// Create a Tmux handle that targets the default server (user's tmux).
     pub fn default_server() -> Self {
@@ -162,7 +298,29 @@ impl Tmux {
         cmd
     }
 
+    /// Take (and cache, inside an observation scope) the raw `pane_id\tpane_dead`
+    /// listing. Returns `None` when no scope is active or the snapshot is absent,
+    /// leaving the caller on its normal uncached path.
+    fn pane_dead_snapshot_uncached(&self) -> Option<String> {
+        let output = self
+            .cmd()
+            .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
     fn pane_dead_flag(&self, pane_id: &str) -> Option<bool> {
+        // `#syncobscache`: `list-panes -a` returns EVERY pane, but this scans it
+        // for one id — so a caller checking N panes issued N identical full
+        // scans (18 in a measured agent-doc focus sync) at ~20ms per subprocess.
+        // Inside an observation scope the snapshot is taken once and shared.
+        if let Some(raw) = cached_pane_dead_snapshot(self) {
+            return parse_pane_dead_flag(&raw, pane_id);
+        }
         let output = self
             .cmd()
             .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
@@ -207,6 +365,12 @@ impl Tmux {
     /// A transient tmux command failure is not evidence that every pane died.
     /// Reapers must propagate the sampling error and preserve the registry.
     pub fn try_alive_pane_ids(&self) -> Result<std::collections::HashSet<String>> {
+        // `#syncobscache`: share the pane snapshot with `pane_dead_flag` inside an
+        // observation scope (see there). Errors are never cached — a transient
+        // tmux failure must not be remembered as a liveness answer.
+        if let Some(raw) = cached_pane_dead_snapshot(self) {
+            return Ok(parse_alive_pane_ids(&raw));
+        }
         let out = self
             .cmd()
             .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
@@ -218,6 +382,7 @@ impl Tmux {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        remember_pane_dead_snapshot(&String::from_utf8_lossy(&out.stdout));
         Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
             .filter_map(|line| {
@@ -253,6 +418,9 @@ impl Tmux {
 
     /// Create a new tmux session and return the pane ID of the first pane.
     pub fn new_session(&self, name: &str, cwd: &Path) -> Result<String> {
+        // #syncobscache: this changes the pane set, so any cached liveness
+        // snapshot is stale from here on.
+        invalidate_pane_snapshot();
         let output = self
             .cmd()
             .args([
@@ -279,6 +447,9 @@ impl Tmux {
 
     /// Create a new window in an existing tmux session and return the pane ID.
     pub fn new_window(&self, session: &str, cwd: &Path) -> Result<String> {
+        // #syncobscache: this changes the pane set, so any cached liveness
+        // snapshot is stale from here on.
+        invalidate_pane_snapshot();
         // Append ":" to force session-name interpretation.
         // Without it, numeric names like "0" are parsed as window indices.
         let target = format!("{}:", session);
@@ -380,6 +551,9 @@ impl Tmux {
     /// `flags` controls split direction: `-h` for horizontal (side-by-side),
     /// `-v` for vertical (stacked). Can include `-d` (don't focus new pane).
     pub fn split_window(&self, target_pane: &str, cwd: &Path, flags: &str) -> Result<String> {
+        // #syncobscache: this changes the pane set, so any cached liveness
+        // snapshot is stale from here on.
+        invalidate_pane_snapshot();
         let output = self
             .cmd()
             .args([
@@ -436,6 +610,9 @@ impl Tmux {
 
     /// Move a pane out of its window into a new window in the same session.
     pub fn break_pane(&self, pane_id: &str) -> Result<()> {
+        // #syncobscache: this changes the pane set, so any cached liveness
+        // snapshot is stale from here on.
+        invalidate_pane_snapshot();
         let session_name = self
             .pane_session(pane_id)
             .with_context(|| format!("failed to resolve tmux session for pane {}", pane_id))?;
@@ -487,6 +664,9 @@ impl Tmux {
     ///
     /// Returns an error instead of risking session destruction.
     pub fn kill_pane(&self, pane_id: &str) -> Result<()> {
+        // #syncobscache: this changes the pane set, so any cached liveness
+        // snapshot is stale from here on.
+        invalidate_pane_snapshot();
         // Guard: check if killing this pane would destroy the session
         if let Ok(window_id) = self.pane_window(pane_id) {
             let panes = self.list_window_panes(&window_id).unwrap_or_default();
@@ -1002,6 +1182,9 @@ impl Tmux {
     /// as part of the stash inventory. Used as fallback when join-pane
     /// to the primary stash window fails (pane too small).
     pub fn break_pane_to_stash(&self, pane_id: &str, _session_name: &str) -> Result<()> {
+        // #syncobscache: this changes the pane set, so any cached liveness
+        // snapshot is stale from here on.
+        invalidate_pane_snapshot();
         // break_pane creates a new detached window without using raw tmux break-pane.
         self.break_pane(pane_id)?;
         // Find the window that now contains this pane and rename it to "stash"
@@ -1792,5 +1975,69 @@ mod tmux_tests {
             "primary and overflow stash windows should both be discovered, got {:?}",
             stash_windows
         );
+    }
+}
+
+#[cfg(test)]
+mod pane_snapshot_scope_tests {
+    use super::*;
+
+    const RAW: &str = "%1\t0\n%2\t1\n%3\t0\n";
+
+    #[test]
+    fn parses_dead_flag_and_alive_set_from_one_snapshot() {
+        assert_eq!(parse_pane_dead_flag(RAW, "%1"), Some(false));
+        assert_eq!(parse_pane_dead_flag(RAW, "%2"), Some(true));
+        assert_eq!(parse_pane_dead_flag(RAW, "%missing"), None);
+
+        let alive = parse_alive_pane_ids(RAW);
+        assert!(alive.contains("%1") && alive.contains("%3"));
+        assert!(!alive.contains("%2"), "a dead pane is not alive");
+        assert_eq!(alive.len(), 2);
+    }
+
+    #[test]
+    fn caching_is_opt_in_and_ends_with_the_guard() {
+        assert!(!scope_is_active(), "no scope by default");
+        {
+            let _scope = begin_pane_snapshot_scope();
+            assert!(scope_is_active());
+            remember_pane_dead_snapshot(RAW);
+            assert!(PANE_SNAPSHOT_SCOPE
+                .with(|s| s.borrow().as_ref().and_then(|s| s.snapshot.clone()))
+                .is_some());
+        }
+        assert!(!scope_is_active(), "the guard must end the scope");
+    }
+
+    /// `#syncobscache`: a mutation changes the pane set, so the snapshot must be
+    /// dropped — serving a stale liveness answer after `kill_pane` would be worse
+    /// than the spawns the cache saves.
+    #[test]
+    fn a_mutation_invalidates_the_snapshot() {
+        let _scope = begin_pane_snapshot_scope();
+        remember_pane_dead_snapshot(RAW);
+        invalidate_pane_snapshot();
+        let cached =
+            PANE_SNAPSHOT_SCOPE.with(|s| s.borrow().as_ref().and_then(|s| s.snapshot.clone()));
+        assert!(cached.is_none(), "a mutation must drop the snapshot");
+    }
+
+    #[test]
+    fn nested_scopes_do_not_discard_the_outer_snapshot() {
+        let outer = begin_pane_snapshot_scope();
+        remember_pane_dead_snapshot(RAW);
+        {
+            let _inner = begin_pane_snapshot_scope();
+            assert!(scope_is_active());
+        }
+        let cached =
+            PANE_SNAPSHOT_SCOPE.with(|s| s.borrow().as_ref().and_then(|s| s.snapshot.clone()));
+        assert!(
+            cached.is_some(),
+            "an inner scope drop must not clear the outer snapshot"
+        );
+        drop(outer);
+        assert!(!scope_is_active());
     }
 }
