@@ -621,8 +621,7 @@ fn load_sqlite_registry(path: &Path) -> Result<Registry> {
     )?;
     let mut registry = Registry::new();
     for row in stmt.query_map([], registry_entry_from_sql_row)? {
-        let (key, entry) = row?;
-        registry.insert(key, entry);
+        insert_readable_registry_row(&mut registry, path, row);
     }
     drop(stmt);
 
@@ -648,14 +647,47 @@ fn load_sqlite_registry(path: &Path) -> Result<Registry> {
         LEFT JOIN documents d
           ON d.document_id = m.document_id
         WHERE d.document_id IS NULL
+          AND m.document_id IS NOT NULL
           AND COALESCE(m.pane, '') <> ''
         "#,
     )?;
     for row in metadata_stmt.query_map([], registry_entry_from_sql_row)? {
-        let (key, entry) = row?;
-        registry.insert(key, entry);
+        insert_readable_registry_row(&mut registry, path, row);
     }
     Ok(registry)
+}
+
+/// Insert one decoded registry row, skipping (and reporting) a row that cannot
+/// be read instead of failing the whole load.
+///
+/// The registry is a recoverable projection of live panes — `resync`/`fix`
+/// rebuild it from tmux. A single unreadable row is therefore survivable, but
+/// propagating its error is not: every command that loads the registry fails,
+/// which turns one bad row into a fleet-wide outage. Observed 2026-07-19 after
+/// SQLite corruption left a `registry_entries` row with a NULL `document_id`
+/// primary key: `Invalid column type Null at index: 0, name: document_id`
+/// aborted the load, and with it `admin detect`, `admin list`, and every
+/// document command on the project.
+///
+/// Per the no-swallowed-errors rule this always reports to stderr; it degrades
+/// the registry, it does not hide the fault.
+fn insert_readable_registry_row(
+    registry: &mut Registry,
+    path: &Path,
+    row: rusqlite::Result<(String, RegistryEntry)>,
+) {
+    match row {
+        Ok((key, entry)) => {
+            registry.insert(key, entry);
+        }
+        Err(err) => {
+            eprintln!(
+                "[registry] warning: skipping unreadable row in {}: {err}. \
+                 The registry is rebuilt from live panes — run `agent-doc fix` to restore it.",
+                path.display()
+            );
+        }
+    }
 }
 
 fn lookup_sqlite_registry(path: &Path, key: &str) -> Result<Option<String>> {
@@ -919,6 +951,59 @@ mod tests {
             window: "@1".to_string(),
             supervisor_instance_id: String::new(),
         }
+    }
+
+    /// One unreadable row must not fail the whole load. SQLite corruption left a
+    /// `registry_entries` row with a NULL `document_id` primary key; propagating
+    /// that decode error aborted every command on the project. The good row must
+    /// still load, and the load must still succeed.
+    #[test]
+    fn sqlite_registry_load_skips_unreadable_rows_instead_of_failing() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join(".agent-doc/state.db");
+        {
+            let conn = open_sqlite_registry(&db).unwrap();
+            conn.execute(
+                "INSERT INTO registry_entries \
+                 (document_id, pane, pid, cwd, started, session_id, file, window, supervisor_instance_id) \
+                 VALUES ('doc-good', '%7', 4242, '/tmp', 'now', 'sess', '/tmp/good.md', '@1', '')",
+                [],
+            )
+            .unwrap();
+            // The corruption shape: a row whose PRIMARY KEY decoded as NULL.
+            conn.execute(
+                "INSERT INTO registry_entries \
+                 (document_id, pane, pid, cwd, started, session_id, file, window, supervisor_instance_id) \
+                 VALUES (NULL, '%9', 4243, '/tmp', 'now', 'sess2', '/tmp/bad.md', '@1', '')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Prove the fixture actually created the corruption shape, so this test
+        // cannot pass vacuously if SQLite ever rejects the NULL primary key.
+        {
+            let conn = open_sqlite_registry(&db).unwrap();
+            let null_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM registry_entries WHERE document_id IS NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(null_rows, 1, "fixture must contain the unreadable row");
+        }
+
+        let registry =
+            load_sqlite_registry(&db).expect("one unreadable row must not fail the registry load");
+        assert!(
+            registry.values().any(|entry| entry.pane == "%7"),
+            "the readable row must still load: {registry:?}"
+        );
+        assert!(
+            !registry.values().any(|entry| entry.pane == "%9"),
+            "the unreadable row must be skipped, not loaded: {registry:?}"
+        );
     }
 
     #[test]
