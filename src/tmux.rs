@@ -2010,6 +2010,32 @@ mod pane_snapshot_scope_tests {
         assert!(!scope_is_active(), "the guard must end the scope");
     }
 
+    /// `#syncobscache2`: the spawn-saving property, asserted deterministically.
+    ///
+    /// The win this cache exists for was measured with an ad-hoc PATH-shim
+    /// spawn counter that is not in the tree, so it cannot be re-run. What it
+    /// was really measuring is this: inside one scope, repeated `pane_dead`
+    /// lookups must be served from a SINGLE snapshot rather than re-spawning
+    /// `list-panes -a` per pane (18 identical scans in the measured focus
+    /// sync). Seeding a sentinel and observing that later reads return it
+    /// unchanged proves no refetch happened, with no subprocess involved.
+    #[test]
+    fn repeated_lookups_in_one_scope_reuse_a_single_snapshot() {
+        let _scope = begin_pane_snapshot_scope();
+        remember_pane_dead_snapshot(RAW);
+
+        // Every pane in the snapshot resolves without another fetch, and the
+        // cached image is byte-identical across reads.
+        for _ in 0..18 {
+            let cached = PANE_SNAPSHOT_SCOPE
+                .with(|s| s.borrow().as_ref().and_then(|s| s.snapshot.clone()))
+                .expect("the seeded snapshot must persist across lookups");
+            assert_eq!(cached, RAW, "a lookup must not replace the snapshot");
+            assert_eq!(parse_pane_dead_flag(&cached, "%1"), Some(false));
+            assert_eq!(parse_pane_dead_flag(&cached, "%2"), Some(true));
+        }
+    }
+
     /// `#syncobscache`: a mutation changes the pane set, so the snapshot must be
     /// dropped — serving a stale liveness answer after `kill_pane` would be worse
     /// than the spawns the cache saves.
