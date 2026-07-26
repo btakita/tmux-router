@@ -732,6 +732,25 @@ struct ExistingSqliteDocument {
     generation: i64,
     pane_id: String,
     window_id: String,
+    actor_state: String,
+}
+
+impl ExistingSqliteDocument {
+    /// Whether this row is already in the state `registry_prune` would write.
+    ///
+    /// `#actorprunenoopchurn`: the prune used to write its `closed`/empty
+    /// transition unconditionally, so an ALREADY closed, already pane-less
+    /// document accrued a fresh no-op transition (`gen N->N`, `pane ''->''`)
+    /// every time the registry was pruned. `prune_dead_actors` measures a
+    /// record's age from `last_transition`, so those writes reset its clock and
+    /// no dead actor could ever exceed `DEAD_ACTOR_PRUNE_AFTER` (1h) — observed
+    /// 2026-07-26 with two closed actors reporting the same 443s age as a LIVE
+    /// document, and the `#actorprune` comment's 251 accumulated rows.
+    ///
+    /// A transition log should record transitions. Nothing changing is not one.
+    fn already_pruned_closed(&self) -> bool {
+        self.actor_state == "closed" && self.pane_id.is_empty() && self.window_id.is_empty()
+    }
 }
 
 fn load_existing_sqlite_document(
@@ -740,7 +759,7 @@ fn load_existing_sqlite_document(
 ) -> Result<Option<ExistingSqliteDocument>> {
     conn.query_row(
         r#"
-        SELECT generation, pane_id, window_id
+        SELECT generation, pane_id, window_id, actor_state
         FROM documents
         WHERE document_id = ?1
         "#,
@@ -750,6 +769,7 @@ fn load_existing_sqlite_document(
                 generation: row.get("generation")?,
                 pane_id: row.get("pane_id")?,
                 window_id: row.get("window_id")?,
+                actor_state: row.get("actor_state")?,
             })
         },
     )
@@ -831,6 +851,15 @@ fn save_sqlite_registry(path: &Path, registry: &Registry) -> Result<()> {
         let Some(existing) = existing else {
             continue;
         };
+        // `#actorprunenoopchurn`: already in the target state — writing the
+        // transition again would only reset this record's prune clock.
+        if existing.already_pruned_closed() {
+            tx.execute(
+                "DELETE FROM registry_entries WHERE document_id = ?1",
+                params![document_id],
+            )?;
+            continue;
+        }
         let transition_id = insert_sqlite_transition(
             &tx,
             &document_id,
@@ -1281,6 +1310,67 @@ mod tests {
             .unwrap();
         assert_eq!(actor_rows, 0);
         assert_eq!(metadata_rows, 1);
+    }
+
+    /// `#actorprunenoopchurn`: pruning an already-closed document must not write
+    /// another transition.
+    ///
+    /// `prune_dead_actors` measures a record's age from its last transition, so a
+    /// prune that re-stamps an already-`closed`, already-pane-less row resets the
+    /// clock it is judged by and the record can never exceed
+    /// `DEAD_ACTOR_PRUNE_AFTER`. Observed 2026-07-26: two closed actors reported
+    /// the same 443s age as a LIVE document, because every registry prune touched
+    /// them again. The count assertion is the point — the first prune is expected
+    /// to write exactly one transition, and repeats must add none.
+    #[test]
+    fn sqlite_registry_prune_does_not_restamp_an_already_closed_document() {
+        let dir = TempDir::new().unwrap();
+        let reg_path = dir.path().join("state.db");
+        let mut registry = Registry::new();
+        registry.insert(
+            "doc-1".to_string(),
+            registry_entry("2026-01-01", "session-1", "doc.md"),
+        );
+        save_registry(&reg_path, &registry).unwrap();
+
+        // Give the document a live actor row so the prune has something to close.
+        let conn = Connection::open(&reg_path).unwrap();
+        conn.execute(
+            "INSERT INTO documents (document_id, canonical_path, session_id, generation, \
+             pane_id, window_id, harness_id, actor_state) \
+             VALUES ('doc-1', 'doc.md', 'session-1', 7, '%1', '@1', 'claude-code', 'ready')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let transitions = |path: &Path| -> i64 {
+            Connection::open(path)
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM actor_transitions", [], |row| row.get(0))
+                .unwrap()
+        };
+        let before = transitions(&reg_path);
+
+        // First prune: the document leaves the registry, so it is closed and one
+        // transition is recorded.
+        save_registry(&reg_path, &Registry::new()).unwrap();
+        let after_first = transitions(&reg_path);
+        assert_eq!(
+            after_first - before,
+            1,
+            "closing a live actor is a real transition and must be recorded"
+        );
+
+        // Repeat prunes: nothing changes, so nothing may be recorded.
+        save_registry(&reg_path, &Registry::new()).unwrap();
+        save_registry(&reg_path, &Registry::new()).unwrap();
+        assert_eq!(
+            transitions(&reg_path),
+            after_first,
+            "an already-closed document must not accrue no-op transitions; each one \
+             resets the dead-actor prune clock and strands the record forever"
+        );
     }
 
     #[test]
