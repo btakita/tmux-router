@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.18 (2026-07-29)
+
+- **Passive layout reconciliation is client-window neutral throughout.** Pane
+  selection inside a background destination window no longer runs the
+  `select-window` half of the normal focus operation. This removes the transient
+  `working → stash → working` focus flash that final-state checks could not
+  detect, while explicit focus actions still activate their requested window.
+
 ## 0.3.17 (2026-07-29)
 
 - **Passive stash moves preserve the stash window's selected pane.** Moving an

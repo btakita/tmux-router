@@ -544,6 +544,17 @@ impl Tmux {
         Ok(())
     }
 
+    /// Select a pane inside its owning window without activating that window.
+    ///
+    /// Passive layout reconciliation uses this to keep the destination
+    /// window's internal focus ready while the attached client remains on the
+    /// operator's current window.
+    pub fn select_pane_preserving_window(&self, pane_id: &str) -> Result<()> {
+        self.raw_cmd(&["select-pane", "-t", pane_id])
+            .with_context(|| format!("failed to select pane {} in place", pane_id))?;
+        Ok(())
+    }
+
     /// Split an existing pane, creating a new pane in the same window.
     ///
     /// Returns the pane ID of the newly created pane.
@@ -1997,6 +2008,31 @@ mod tmux_tests {
             stash_windows.len() >= 2,
             "primary and overflow stash windows should both be discovered, got {:?}",
             stash_windows
+        );
+    }
+
+    #[test]
+    fn select_pane_preserving_window_does_not_activate_background_window() {
+        let iso = IsolatedTmux::new("tmux-select-pane-preserve-window");
+        let cwd = Path::new("/tmp");
+        let foreground = iso.new_session("selection-test", cwd).unwrap();
+        let foreground_window = iso.pane_window(&foreground).unwrap();
+        let background = iso.new_window("selection-test", cwd).unwrap();
+        let background_window = iso.pane_window(&background).unwrap();
+        assert_ne!(foreground_window, background_window);
+
+        iso.select_window(&foreground_window).unwrap();
+        iso.select_pane_preserving_window(&background).unwrap();
+
+        assert_eq!(
+            iso.active_window("selection-test").as_deref(),
+            Some(foreground_window.as_str()),
+            "selecting a background pane in place must not activate its window"
+        );
+        assert_eq!(
+            iso.selected_pane_in_window(&background_window).as_deref(),
+            Some(background.as_str()),
+            "the background window should still record its internal selected pane"
         );
     }
 

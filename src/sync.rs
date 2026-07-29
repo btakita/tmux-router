@@ -90,6 +90,14 @@ use std::path::{Path, PathBuf};
 /// When a window can't fit all panes at this height, overflow panes are stashed.
 pub const MIN_PANE_HEIGHT: usize = 10;
 
+/// Whether a reconcile pane selection should also activate the pane's window.
+///
+/// Kept as a pure decision so deterministic projection tests can exercise the
+/// same window-activation policy as the live tmux path.
+pub fn reconcile_selection_activates_window(passive: bool) -> bool {
+    !passive
+}
+
 use crate::registry;
 use crate::tmux::Tmux;
 
@@ -524,8 +532,16 @@ pub struct SyncOptions<'a> {
 /// the operator may be typing in a different pane and re-selecting on every poll
 /// disrupts them (#panefocussteal). Explicit (non-passive) syncs always reselect
 /// so Claim / manual focus / Run bring the requested pane into view.
-pub(crate) fn should_reselect_focus(passive: bool, focus_pane_already_placed: bool) -> bool {
-    !(passive && focus_pane_already_placed)
+pub(crate) fn should_reselect_focus(passive: bool, _focus_pane_already_placed: bool) -> bool {
+    !passive
+}
+
+fn select_reconcile_pane(tmux: &Tmux, pane_id: &str, passive: bool) -> Result<()> {
+    if reconcile_selection_activates_window(passive) {
+        tmux.select_pane(pane_id)
+    } else {
+        tmux.select_pane_preserving_window(pane_id)
+    }
 }
 
 /// `#panefocussteal`: restore the operator's pre-reconcile active pane after a
@@ -549,6 +565,13 @@ fn restore_operator_focus(
         return;
     };
     if !tmux.pane_alive(op) || pane_in_stash_window(tmux, op, session_name) {
+        return;
+    }
+    if session_name
+        .and_then(|session| tmux.active_pane(session))
+        .as_deref()
+        == Some(op)
+    {
         return;
     }
     if tmux.select_pane(op).is_ok() {
@@ -1271,7 +1294,7 @@ pub fn reconcile(
                         update_registry(tmux, outgoing, registry_path, &mut log);
 
                         let select_target = focus_pane.unwrap_or(first_pane);
-                        let _ = tmux.select_pane(select_target);
+                        let _ = select_reconcile_pane(tmux, select_target, options.passive);
                         log.log("SELECT", format!("focused {}", select_target));
 
                         restore_operator_focus(
@@ -1369,7 +1392,7 @@ pub fn reconcile(
 
     // --- SELECT focus pane (before detach, so stash won't change selection) ---
     let select_target = focus_pane.unwrap_or(first_pane);
-    let _ = tmux.select_pane(select_target);
+    let _ = select_reconcile_pane(tmux, select_target, options.passive);
     log.log(
         "SELECT",
         format!("pre-selected {} before detach", select_target),
@@ -1471,7 +1494,9 @@ pub fn reconcile(
             ),
         );
     }
-    let _ = tmux.select_window(target_window);
+    if reconcile_selection_activates_window(options.passive) {
+        let _ = tmux.select_window(target_window);
+    }
     let sel = session_name
         .and_then(|s| tmux.active_pane(s))
         .unwrap_or_default();
@@ -1515,7 +1540,7 @@ pub fn reconcile(
             }
         }
         // Re-select focus after reorder
-        let _ = tmux.select_pane(select_target);
+        let _ = select_reconcile_pane(tmux, select_target, options.passive);
     }
 
     // --- VERIFY ---
@@ -1801,15 +1826,16 @@ mod tests {
     #[test]
     fn passive_sync_does_not_steal_focus_when_pane_already_placed() {
         // The operator is typing in a different tmux pane; a passive editor poll
-        // fires with the document pane already placed. It must NOT reselect
-        // (which would steal the active pane).
+        // must never activate another window. The immediate editor-focus lane owns
+        // deliberate client focus; passive layout only updates placement.
         assert!(!should_reselect_focus(true, true));
-        // Passive but the document pane isn't placed yet → bring it into view.
-        assert!(should_reselect_focus(true, false));
+        assert!(!should_reselect_focus(true, false));
+        assert!(!reconcile_selection_activates_window(true));
         // Explicit (Claim / manual focus / Run) always reselects the requested
         // pane, whether or not it is already placed.
         assert!(should_reselect_focus(false, true));
         assert!(should_reselect_focus(false, false));
+        assert!(reconcile_selection_activates_window(false));
     }
 
     // --- Layout parsing unit tests ---
