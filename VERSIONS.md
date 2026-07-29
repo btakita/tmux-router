@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.3.19 (2026-07-29)
+
+- **Passive reconciliation preserves the active pane as well as its window.**
+  When the requested document pane is adjacent in the visible window, the
+  router skips selection instead of briefly diverting keyboard input. Background
+  windows may still update their internal selected pane without activation.
+- **Passive focus invariants emit actionable runtime diagnostics.** Every
+  background selection compares the client-visible window and pane before and
+  after the effect. Unexpected movement logs a structured
+  `focus_steal_detected=true` warning with the boundary, target, and snapshots,
+  then immediately restores the operator pane.
+
 ## 0.3.18 (2026-07-29)
 
 - **Passive layout reconciliation is client-window neutral throughout.** Pane

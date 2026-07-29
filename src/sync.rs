@@ -98,6 +98,29 @@ pub fn reconcile_selection_activates_window(passive: bool) -> bool {
     !passive
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileSelectionMode {
+    Activate,
+    SelectInBackground,
+    PreserveVisiblePane,
+}
+
+/// Choose the smallest pane-selection effect allowed for this reconciliation.
+///
+/// A passive selection may update a background window's internal selected pane,
+/// but must be a no-op when the target is an inactive pane in the visible
+/// window. Selecting it there would immediately steal keyboard focus.
+pub fn reconcile_selection_mode(
+    passive: bool,
+    target_window_is_active: bool,
+) -> ReconcileSelectionMode {
+    match (passive, target_window_is_active) {
+        (false, _) => ReconcileSelectionMode::Activate,
+        (true, true) => ReconcileSelectionMode::PreserveVisiblePane,
+        (true, false) => ReconcileSelectionMode::SelectInBackground,
+    }
+}
+
 use crate::registry;
 use crate::tmux::Tmux;
 
@@ -536,12 +559,81 @@ pub(crate) fn should_reselect_focus(passive: bool, _focus_pane_already_placed: b
     !passive
 }
 
-fn select_reconcile_pane(tmux: &Tmux, pane_id: &str, passive: bool) -> Result<()> {
-    if reconcile_selection_activates_window(passive) {
-        tmux.select_pane(pane_id)
-    } else {
-        tmux.select_pane_preserving_window(pane_id)
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxFocusSnapshot {
+    window: Option<String>,
+    pane: Option<String>,
+}
+
+fn tmux_focus_snapshot(tmux: &Tmux, session_name: Option<&str>) -> Option<TmuxFocusSnapshot> {
+    session_name.map(|session| TmuxFocusSnapshot {
+        window: tmux.active_window(session),
+        pane: tmux.active_pane(session),
+    })
+}
+
+fn log_passive_focus_transition(
+    before: &Option<TmuxFocusSnapshot>,
+    after: &Option<TmuxFocusSnapshot>,
+    target_pane: &str,
+    boundary: &str,
+    log: &mut SyncLog,
+) -> bool {
+    if before == after {
+        return false;
     }
+    log.log(
+        "FOCUS_GUARD",
+        format!(
+            "WARNING focus_steal_detected=true boundary={boundary} target_pane={target_pane} \
+             before={before:?} after={after:?}",
+        ),
+    );
+    true
+}
+
+fn select_reconcile_pane(
+    tmux: &Tmux,
+    pane_id: &str,
+    session_name: Option<&str>,
+    passive: bool,
+    log: &mut SyncLog,
+) -> Result<()> {
+    let before = tmux_focus_snapshot(tmux, session_name);
+    let target_window = tmux.pane_window(pane_id).ok();
+    let target_window_is_active =
+        before.as_ref().and_then(|focus| focus.window.as_ref()) == target_window.as_ref();
+    match reconcile_selection_mode(passive, target_window_is_active) {
+        ReconcileSelectionMode::Activate => return tmux.select_pane(pane_id),
+        ReconcileSelectionMode::PreserveVisiblePane => {
+            log.log(
+                "SELECT",
+                format!(
+                    "passive: preserved active pane; skipped selection of {} in visible window",
+                    pane_id
+                ),
+            );
+            return Ok(());
+        }
+        ReconcileSelectionMode::SelectInBackground => {}
+    }
+
+    tmux.select_pane_preserving_window(pane_id)?;
+    let after = tmux_focus_snapshot(tmux, session_name);
+    if log_passive_focus_transition(&before, &after, pane_id, "select-pane", log)
+        && let Some(operator_pane) = before.as_ref().and_then(|focus| focus.pane.as_deref())
+        && tmux.pane_alive(operator_pane)
+        && let Err(error) = tmux.select_pane(operator_pane)
+    {
+        log.log_err(
+            "FOCUS_GUARD",
+            format!(
+                "failed to restore operator pane {} after detected focus steal: {}",
+                operator_pane, error
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// `#panefocussteal`: restore the operator's pre-reconcile active pane after a
@@ -574,6 +666,13 @@ fn restore_operator_focus(
     {
         return;
     }
+    log.log(
+        "FOCUS_GUARD",
+        format!(
+            "WARNING focus_steal_detected=true boundary=reconcile target_pane=unknown \
+             expected_operator_pane={op}"
+        ),
+    );
     if tmux.select_pane(op).is_ok() {
         log.log(
             "FOCUS",
@@ -1294,8 +1393,17 @@ pub fn reconcile(
                         update_registry(tmux, outgoing, registry_path, &mut log);
 
                         let select_target = focus_pane.unwrap_or(first_pane);
-                        let _ = select_reconcile_pane(tmux, select_target, options.passive);
-                        log.log("SELECT", format!("focused {}", select_target));
+                        let _ = select_reconcile_pane(
+                            tmux,
+                            select_target,
+                            session_name,
+                            options.passive,
+                            &mut log,
+                        );
+                        log.log(
+                            "SELECT",
+                            format!("reconciled selection for {}", select_target),
+                        );
 
                         restore_operator_focus(
                             tmux,
@@ -1392,10 +1500,10 @@ pub fn reconcile(
 
     // --- SELECT focus pane (before detach, so stash won't change selection) ---
     let select_target = focus_pane.unwrap_or(first_pane);
-    let _ = select_reconcile_pane(tmux, select_target, options.passive);
+    let _ = select_reconcile_pane(tmux, select_target, session_name, options.passive, &mut log);
     log.log(
         "SELECT",
-        format!("pre-selected {} before detach", select_target),
+        format!("reconciled selection for {} before detach", select_target),
     );
 
     // --- DETACH unwanted panes ---
@@ -1481,11 +1589,14 @@ pub fn reconcile(
         }
     }
 
-    // Re-select target window after stash operations (restore focus if stolen)
+    // Explicit sync activates the target window. Passive sync instead compares
+    // against the operator's pre-detach window and immediately repairs any
+    // unexpected drift before later reconcile phases can expose it.
     let active_after_detach = session_name
         .and_then(|s| tmux.active_window(s))
         .unwrap_or_default();
-    if active_after_detach != target_window {
+    if reconcile_selection_activates_window(options.passive) && active_after_detach != target_window
+    {
         log.log(
             "DETACH",
             format!(
@@ -1493,9 +1604,31 @@ pub fn reconcile(
                 active_after_detach, target_window
             ),
         );
-    }
-    if reconcile_selection_activates_window(options.passive) {
         let _ = tmux.select_window(target_window);
+    } else if options.passive
+        && !active_before_detach.is_empty()
+        && active_after_detach != active_before_detach
+    {
+        log.log(
+            "FOCUS_GUARD",
+            format!(
+                "WARNING focus_steal_detected=true boundary=detach target_pane=unknown \
+                 before_window={} after_window={}",
+                active_before_detach, active_after_detach
+            ),
+        );
+        if let Some(operator_pane) = operator_focus_restore.as_deref()
+            && tmux.pane_alive(operator_pane)
+            && let Err(error) = tmux.select_pane(operator_pane)
+        {
+            log.log_err(
+                "FOCUS_GUARD",
+                format!(
+                    "failed to restore operator pane {} after detach focus steal: {}",
+                    operator_pane, error
+                ),
+            );
+        }
     }
     let sel = session_name
         .and_then(|s| tmux.active_pane(s))
@@ -1540,7 +1673,7 @@ pub fn reconcile(
             }
         }
         // Re-select focus after reorder
-        let _ = select_reconcile_pane(tmux, select_target, options.passive);
+        let _ = select_reconcile_pane(tmux, select_target, session_name, options.passive, &mut log);
     }
 
     // --- VERIFY ---
@@ -5176,6 +5309,65 @@ mod tests {
             final_panes.contains(&pane_b),
             "B should be joined from different session"
         );
+    }
+
+    #[test]
+    fn passive_selection_skips_inactive_pane_in_visible_window() {
+        let t = IsolatedTmux::new("sync-test-passive-visible-pane");
+        let tmp = TempDir::new().unwrap();
+
+        let operator_pane = t.new_session("test", tmp.path()).unwrap();
+        let document_pane = t
+            .raw_cmd(&[
+                "split-window",
+                "-d",
+                "-t",
+                &operator_pane,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
+            .unwrap();
+        t.select_pane(&operator_pane).unwrap();
+
+        let mut log = SyncLog::new();
+        select_reconcile_pane(&t, &document_pane, Some("test"), true, &mut log).unwrap();
+
+        assert_eq!(
+            t.active_pane("test").as_deref(),
+            Some(operator_pane.as_str()),
+            "passive selection must not transiently select an adjacent document pane"
+        );
+        assert!(log.entries.iter().any(|entry| {
+            entry.phase == "SELECT" && entry.message.contains("preserved active pane")
+        }));
+    }
+
+    #[test]
+    fn passive_focus_transition_emits_structured_warning() {
+        let before = Some(TmuxFocusSnapshot {
+            window: Some("@1".to_string()),
+            pane: Some("%1".to_string()),
+        });
+        let after = Some(TmuxFocusSnapshot {
+            window: Some("@1".to_string()),
+            pane: Some("%2".to_string()),
+        });
+        let mut log = SyncLog::new();
+
+        assert!(log_passive_focus_transition(
+            &before,
+            &after,
+            "%2",
+            "select-pane",
+            &mut log,
+        ));
+        assert!(log.entries.iter().any(|entry| {
+            entry.phase == "FOCUS_GUARD"
+                && entry.message.contains("focus_steal_detected=true")
+                && entry.message.contains("target_pane=%2")
+        }));
     }
 
     #[test]
