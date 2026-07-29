@@ -4492,9 +4492,8 @@ mod tests {
         // Regression for cross-document focus mis-binding: when the focus
         // document has no live owned pane (e.g. its registered pane died after a
         // Codex restart), focus must preserve selection rather than jumping to a
-        // column-mate's pane belonging to another document (e.g. the
-        // equityfundingsource.md pane).
-        let focus = PathBuf::from("agent-doc-bugs2.md");
+        // column-mate's pane belonging to another document.
+        let focus = PathBuf::from("focused.md");
         let result = resolve_focus_pane(Some(&focus), &[], None, "%99");
         assert_eq!(
             result, None,

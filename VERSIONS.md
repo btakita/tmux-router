@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.3.17 (2026-07-29)
+
+- **Passive stash moves preserve the stash window's selected pane.** Moving an
+  unrelated pane into a detached stash window no longer changes which session
+  appears selected inside that window. The router snapshots and restores the
+  destination's internal selection without activating the window.
+
 ## 0.3.16 (2026-07-28)
 
 - **Caller-proven pane bindings outrank spare layout geometry.** `SyncOptions`

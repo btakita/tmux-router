@@ -1120,6 +1120,10 @@ impl Tmux {
         };
         let stash_panes = self.list_window_panes(&stash_window).unwrap_or_default();
         if !stash_panes.is_empty() {
+            // join-pane -d keeps the destination window detached, but tmux may
+            // still change which pane is selected inside that window when the
+            // split target differs from its currently selected pane.
+            let selected_pane = self.selected_pane_in_window(&stash_window);
             // Resize stash window tall enough to accept another pane.
             // Use a very large size to prevent "pane too small" errors.
             // The stash window is never displayed, so size doesn't matter visually.
@@ -1133,7 +1137,19 @@ impl Tmux {
             // On failure: kill the pane instead of creating an orphan stash window.
             // Creating orphan windows (via break_pane) causes stash proliferation.
             match self.join_pane(pane_id, &target, "-dv") {
-                Ok(()) => Ok(()),
+                Ok(()) => {
+                    if let Some(selected_pane) = selected_pane {
+                        // select-pane alone restores the destination window's
+                        // internal selection without activating that window.
+                        if let Err(error) = self.raw_cmd(&["select-pane", "-t", &selected_pane]) {
+                            eprintln!(
+                                "[stash] failed to restore selected pane {} after moving {}: {}",
+                                selected_pane, pane_id, error
+                            );
+                        }
+                    }
+                    Ok(())
+                }
                 Err(e) => {
                     eprintln!(
                         "[stash] join-pane {} → {} failed ({}), breaking to overflow stash",
@@ -1147,6 +1163,13 @@ impl Tmux {
             // but create a stash overflow window just in case.
             self.break_pane_to_stash(pane_id, session_name)
         }
+    }
+
+    fn selected_pane_in_window(&self, window_id: &str) -> Option<String> {
+        self.raw_cmd(&["display-message", "-t", window_id, "-p", "#{pane_id}"])
+            .ok()
+            .map(|pane| pane.trim().to_string())
+            .filter(|pane| !pane.is_empty())
     }
 
     /// Find the largest pane (by height) in a window.
@@ -1974,6 +1997,44 @@ mod tmux_tests {
             stash_windows.len() >= 2,
             "primary and overflow stash windows should both be discovered, got {:?}",
             stash_windows
+        );
+    }
+
+    #[test]
+    fn stash_pane_preserves_destination_selected_pane() {
+        let iso = IsolatedTmux::new("tmux-stash-preserve-selection");
+        let cwd = Path::new("/tmp");
+        let selected = iso.new_session("selection-test", cwd).unwrap();
+        let stash_window = iso.pane_window(&selected).unwrap();
+        iso.raw_cmd(&["rename-window", "-t", &stash_window, "stash"])
+            .unwrap();
+        iso.raw_cmd(&[
+            "resize-window",
+            "-t",
+            &stash_window,
+            "-x",
+            "120",
+            "-y",
+            "40",
+        ])
+        .unwrap();
+        let larger = iso.split_window(&selected, cwd, "-dv").unwrap();
+        iso.raw_cmd(&["resize-pane", "-t", &selected, "-y", "5"])
+            .unwrap();
+        iso.raw_cmd(&["select-pane", "-t", &selected]).unwrap();
+        assert_eq!(
+            iso.largest_pane_in_window(&stash_window).as_deref(),
+            Some(larger.as_str()),
+            "the join target must differ from the selected pane for this regression"
+        );
+
+        let incoming = iso.new_window("selection-test", cwd).unwrap();
+        iso.stash_pane(&incoming, "selection-test").unwrap();
+
+        assert_eq!(
+            iso.selected_pane_in_window(&stash_window).as_deref(),
+            Some(selected.as_str()),
+            "moving a pane into stash must not change stash's selected pane"
         );
     }
 }
