@@ -1347,7 +1347,9 @@ mod tests {
         let transitions = |path: &Path| -> i64 {
             Connection::open(path)
                 .unwrap()
-                .query_row("SELECT COUNT(*) FROM actor_transitions", [], |row| row.get(0))
+                .query_row("SELECT COUNT(*) FROM actor_transitions", [], |row| {
+                    row.get(0)
+                })
                 .unwrap()
         };
         let before = transitions(&reg_path);

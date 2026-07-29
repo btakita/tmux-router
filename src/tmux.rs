@@ -2100,9 +2100,11 @@ mod pane_snapshot_scope_tests {
             let _scope = begin_pane_snapshot_scope();
             assert!(scope_is_active());
             remember_pane_dead_snapshot(RAW);
-            assert!(PANE_SNAPSHOT_SCOPE
-                .with(|s| s.borrow().as_ref().and_then(|s| s.snapshot.clone()))
-                .is_some());
+            assert!(
+                PANE_SNAPSHOT_SCOPE
+                    .with(|s| s.borrow().as_ref().and_then(|s| s.snapshot.clone()))
+                    .is_some()
+            );
         }
         assert!(!scope_is_active(), "the guard must end the scope");
     }
