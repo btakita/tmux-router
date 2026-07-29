@@ -82,7 +82,7 @@
 //! - `registry_update_nonfatal`: registry write fails after pane move → sync completes, warning logged, `SyncLog::has_errors()` false (registry is advisory)
 
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Minimum pane height (rows) for a usable Claude Code session.
@@ -499,6 +499,14 @@ pub struct SyncOptions<'a> {
     /// Returns `true` to allow ephemeral assignment, `false` to keep the file
     /// unresolved for this sync cycle.
     pub allow_unresolved_pane_assignment: Option<&'a dyn Fn(&Path) -> bool>,
+    /// Caller-proven file-to-pane bindings that are authoritative for this
+    /// reconciliation even when the pane is owned by a different registry.
+    ///
+    /// This is intentionally an in-memory input, not a registry write. It lets
+    /// a higher-level router compose project-scoped registries without copying
+    /// or re-owning their durable entries. Dead panes are ignored and fall back
+    /// to the normal registry/unresolved path.
+    pub pre_resolved_panes: Option<&'a HashMap<PathBuf, String>>,
     /// When `true`, this is a passive editor-driven sync (SafePassive: the 5s
     /// layout poll or an editor tab-selection). Passive syncs reconcile layout
     /// but must NOT steal the tmux active pane when the document pane is already
@@ -642,7 +650,16 @@ pub fn sync_with_options(
                     eprintln!("tmux_session={} (from {})", ts, file.display());
                 }
 
-                match registry::lookup(registry_path, &key)? {
+                let pre_resolved = options
+                    .pre_resolved_panes
+                    .and_then(|panes| panes.get(*file))
+                    .filter(|pane| tmux.pane_alive(pane))
+                    .cloned();
+                let registered_pane = match pre_resolved {
+                    Some(pane) => Some(pane),
+                    None => registry::lookup(registry_path, &key)?,
+                };
+                match registered_pane {
                     Some(pane_id) if tmux.pane_alive(&pane_id) => {
                         resolved.push(ResolvedFile {
                             path: file.to_path_buf(),
@@ -5966,6 +5983,7 @@ mod tests {
         let options = SyncOptions {
             protect_pane: None,
             allow_unresolved_pane_assignment: Some(&allow_unresolved_pane_assignment),
+            pre_resolved_panes: None,
             passive: false,
         };
 
@@ -5995,5 +6013,102 @@ mod tests {
             t.pane_alive(&pane_a),
             "spare pane should be stashed, not killed"
         );
+    }
+
+    #[test]
+    fn pre_resolved_foreign_pane_outranks_spare_geometry() {
+        let t = IsolatedTmux::new("sync-test-pre-resolved-foreign-pane");
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let pane_local = t.new_session("test", tmp.path()).unwrap();
+        let target_window = t.pane_window(&pane_local).unwrap();
+        let pane_spare = t
+            .raw_cmd(&[
+                "split-window",
+                "-t",
+                &pane_local,
+                "-h",
+                "-P",
+                "-F",
+                "#{pane_id}",
+            ])
+            .unwrap()
+            .trim()
+            .to_string();
+        let pane_foreign = t.new_window("test", tmp.path()).unwrap();
+
+        let file_local = tmp.path().join("local.md");
+        let file_foreign = tmp.path().join("foreign.md");
+        std::fs::write(&file_local, "# Local\n").unwrap();
+        std::fs::write(&file_foreign, "# Foreign\n").unwrap();
+
+        let registry_path = tmp.path().join("registry.json");
+        let mut registry = crate::registry::Registry::new();
+        registry.insert(
+            "session-local".to_string(),
+            crate::registry::RegistryEntry {
+                pane: pane_local.clone(),
+                pid: std::process::id(),
+                cwd: tmp.path().to_string_lossy().to_string(),
+                started: String::new(),
+                session_id: "session-local".to_string(),
+                file: file_local.to_string_lossy().to_string(),
+                window: target_window.clone(),
+                supervisor_instance_id: String::new(),
+            },
+        );
+        crate::registry::save_registry(&registry_path, &registry).unwrap();
+
+        let col_args = vec![
+            file_local.to_string_lossy().to_string(),
+            file_foreign.to_string_lossy().to_string(),
+        ];
+        let resolve_file = |path: &Path| -> Option<FileResolution> {
+            let key = if path == file_local {
+                "session-local"
+            } else if path == file_foreign {
+                "session-foreign"
+            } else {
+                return None;
+            };
+            Some(FileResolution::Registered {
+                key: key.to_string(),
+                tmux_session: Some("test".to_string()),
+            })
+        };
+        let pre_resolved_panes = HashMap::from([(file_foreign.clone(), pane_foreign.clone())]);
+        let options = SyncOptions {
+            pre_resolved_panes: Some(&pre_resolved_panes),
+            passive: false,
+            ..Default::default()
+        };
+
+        let result = sync_with_options(
+            &col_args,
+            Some(&target_window),
+            Some(file_foreign.to_string_lossy().as_ref()),
+            &t,
+            &registry_path,
+            &resolve_file,
+            &options,
+        )
+        .unwrap();
+
+        assert!(
+            result
+                .file_panes
+                .contains(&(file_foreign.clone(), pane_foreign.clone())),
+            "caller-proven foreign pane must remain bound to its document"
+        );
+        assert!(
+            !result
+                .file_panes
+                .contains(&(file_foreign.clone(), pane_spare.clone())),
+            "visible spare geometry must not alias the foreign document"
+        );
+        let final_panes = t.list_window_panes(&target_window).unwrap();
+        assert!(final_panes.contains(&pane_local));
+        assert!(final_panes.contains(&pane_foreign));
+        assert!(!final_panes.contains(&pane_spare));
     }
 }

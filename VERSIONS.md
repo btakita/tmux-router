@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.16 (2026-07-28)
+
+- **Caller-proven pane bindings outrank spare layout geometry.** `SyncOptions`
+  accepts ephemeral file-to-pane bindings that an owning controller has already
+  proven. Live bindings resolve before the local registry and cannot be aliased
+  to an unrelated visible spare; dead bindings safely fall back to normal
+  resolution. This lets parent workspaces surface nested-project actors without
+  copying the nested project's durable registry state.
+
 ## 0.3.12 (2026-06-27)
 
 - **Stash-origin pane replacement avoids `swap-pane`.** A 1-in/1-out reconcile still uses the atomic `swap-pane` fast path for ordinary panes, but if the incoming pane is parked in a `stash`/`stash-*` window it now skips `swap-pane` and reattaches through ATTACH/DETACH. This avoids the tmux crash path reported when panes move from the stash window back into the visible agent-doc window.
