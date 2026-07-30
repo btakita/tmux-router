@@ -730,13 +730,17 @@ pub fn sync_with_options(
             .unwrap_or(true)
     };
 
-    // Log comprehensive tmux tree at sync start
-    if let Ok(tree) = tmux.dump_tmux_tree() {
-        eprintln!("{}", tree);
-    }
-
     let mut global_log = SyncLog::new();
-    global_log.log_global_state(tmux, "sync-start");
+    // Full tree diagnostics are useful for deliberate/manual reconciliation,
+    // but they issue several tmux observations before and after every pass.
+    // Passive editor ingress is already covered by the reconcile log and focus
+    // invariant diagnostics, so keep these global scans off its latency path.
+    if !options.passive {
+        if let Ok(tree) = tmux.dump_tmux_tree() {
+            eprintln!("{}", tree);
+        }
+        global_log.log_global_state(tmux, "sync-start");
+    }
 
     // --- Phase 1: Resolve each file to its session pane ---
     let mut resolved: Vec<ResolvedFile> = Vec::new();
@@ -745,8 +749,22 @@ pub fn sync_with_options(
     let mut doc_tmux_session: Option<String> = None;
 
     for file in &all_files {
-        if !file.exists() {
-            eprintln!("warning: file not found: {}, skipping", file.display());
+        // A caller-proven live binding is already the resolution. In
+        // particular, do not call `resolve_file` first: that callback may cross
+        // an editor-authority boundary to inspect an unsaved buffer, while the
+        // owning controller's generation-fenced file→pane fact is sufficient
+        // for layout placement by itself. This also permits a newly-created
+        // editor buffer whose path is not on disk yet.
+        if let Some(pane_id) = options
+            .pre_resolved_panes
+            .and_then(|panes| panes.get(*file))
+            .filter(|pane| tmux.pane_alive(pane))
+            .cloned()
+        {
+            resolved.push(ResolvedFile {
+                path: file.to_path_buf(),
+                pane_id,
+            });
             continue;
         }
 
@@ -772,15 +790,7 @@ pub fn sync_with_options(
                     eprintln!("tmux_session={} (from {})", ts, file.display());
                 }
 
-                let pre_resolved = options
-                    .pre_resolved_panes
-                    .and_then(|panes| panes.get(*file))
-                    .filter(|pane| tmux.pane_alive(pane))
-                    .cloned();
-                let registered_pane = match pre_resolved {
-                    Some(pane) => Some(pane),
-                    None => registry::lookup(registry_path, &key)?,
-                };
+                let registered_pane = registry::lookup(registry_path, &key)?;
                 match registered_pane {
                     Some(pane_id) if tmux.pane_alive(&pane_id) => {
                         resolved.push(ResolvedFile {
@@ -1236,8 +1246,11 @@ pub fn sync_with_options(
         &mut log,
     );
 
-    // Log global tmux state at sync end
-    global_log.log_global_state(tmux, "sync-end");
+    // Match the start boundary above: passive editor ingress avoids redundant
+    // global scans after the layout effect has already proved its result.
+    if !options.passive {
+        global_log.log_global_state(tmux, "sync-end");
+    }
 
     if log.has_errors() {
         eprintln!(
@@ -6255,9 +6268,8 @@ mod tests {
         let pane_foreign = t.new_window("test", tmp.path()).unwrap();
 
         let file_local = tmp.path().join("local.md");
-        let file_foreign = tmp.path().join("foreign.md");
+        let file_foreign = tmp.path().join("foreign-unsaved.md");
         std::fs::write(&file_local, "# Local\n").unwrap();
-        std::fs::write(&file_foreign, "# Foreign\n").unwrap();
 
         let registry_path = tmp.path().join("registry.json");
         let mut registry = crate::registry::Registry::new();
@@ -6284,7 +6296,7 @@ mod tests {
             let key = if path == file_local {
                 "session-local"
             } else if path == file_foreign {
-                "session-foreign"
+                panic!("caller-proven binding must bypass document resolution")
             } else {
                 return None;
             };
@@ -6315,7 +6327,7 @@ mod tests {
             result
                 .file_panes
                 .contains(&(file_foreign.clone(), pane_foreign.clone())),
-            "caller-proven foreign pane must remain bound to its document"
+            "caller-proven foreign pane must remain bound to its unsaved document"
         );
         assert!(
             !result

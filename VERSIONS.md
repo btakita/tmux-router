@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.20 (2026-07-29)
+
+- **Controller-proven pane bindings bypass document resolution.** A live
+  `pre_resolved_panes` entry now resolves before filesystem existence checks,
+  editor-authority callbacks, and registry lookup. This supports unsaved
+  editor buffers and removes redundant authority RPCs from tab-navigation
+  reconciliation.
+- **Passive reconciliation defers redundant global diagnostics.** Full tmux-tree
+  scans remain on deliberate/manual syncs, while passive editor ingress uses
+  the reconcile and focus-invariant diagnostics already produced by its effect.
+
 ## 0.3.19 (2026-07-29)
 
 - **Passive reconciliation preserves the active pane as well as its window.**

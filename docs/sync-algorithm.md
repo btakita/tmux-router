@@ -11,12 +11,18 @@ The sync algorithm arranges tmux panes to match a declarative column layout.
 
 ## Phases
 
-1. **Resolve** — Map files to pane IDs via the registry
+1. **Resolve** — Accept live caller-proven file→pane bindings directly, then map
+   the remainder via the registry. A proven binding does not require a disk file
+   or a document-content resolution call.
 2. **Auto-register** — Unresolved files share a pane with another file in the same column (ephemeral, not persisted)
 3. **Build columns** — Group resolved panes into the column structure
 4. **Pick target window** — Find the window containing the most desired panes
 5. **Reconcile** — Attach-first algorithm: join missing panes, then evict unwanted ones; non-stash 1-in/1-out replacements may use `swap-pane`
 6. **Equalize** — Resize panes for even distribution
+
+Passive editor-driven reconciliation omits the full global tmux-tree diagnostic
+scans at the start and end of the pass. Reconcile/focus diagnostics remain
+active, while the redundant scans stay off the editor navigation latency path.
 
 ## Reconciliation: Attach-First
 
