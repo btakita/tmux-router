@@ -254,10 +254,17 @@ fn cached_pane_dead_snapshot(tmux: &Tmux) -> Option<String> {
     Some(raw)
 }
 
+/// `list-panes -a` column format shared by every snapshot spawn: pane id, dead
+/// flag, and owning session. One listing answers liveness AND session-name
+/// lookups inside an observation scope (`#syncobscache` / `#panesessionsnapshot`),
+/// so the controller's per-pane `pane_session` probes collapse from N
+/// `display-message` spawns to a single shared listing.
+const PANE_SNAPSHOT_FORMAT: &str = "#{pane_id}\t#{pane_dead}\t#{session_name}";
+
 /// Parse one pane's `pane_dead` flag out of a raw snapshot.
 fn parse_pane_dead_flag(raw: &str, pane_id: &str) -> Option<bool> {
     for line in raw.lines() {
-        let mut parts = line.splitn(2, '\t');
+        let mut parts = line.splitn(3, '\t');
         let id = parts.next()?;
         if id.trim() != pane_id {
             continue;
@@ -271,7 +278,7 @@ fn parse_pane_dead_flag(raw: &str, pane_id: &str) -> Option<bool> {
 fn parse_alive_pane_ids(raw: &str) -> std::collections::HashSet<String> {
     raw.lines()
         .filter_map(|line| {
-            let mut parts = line.splitn(2, '\t');
+            let mut parts = line.splitn(3, '\t');
             let pane_id = parts.next()?.trim();
             let pane_dead = parts.next().unwrap_or("0").trim();
             if pane_id.is_empty() || pane_dead == "1" {
@@ -281,6 +288,29 @@ fn parse_alive_pane_ids(raw: &str) -> std::collections::HashSet<String> {
             }
         })
         .collect()
+}
+
+/// Parse one pane's owning session name out of a raw snapshot.
+///
+/// Returns `None` when the pane is absent or the session column is empty, so a
+/// caller falls back to its normal uncached `display-message` probe rather than
+/// treating a missing row as evidence of no session.
+fn parse_pane_session(raw: &str, pane_id: &str) -> Option<String> {
+    for line in raw.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let id = parts.next()?;
+        if id.trim() != pane_id {
+            continue;
+        }
+        let _dead_flag = parts.next();
+        let session = parts.next()?.trim();
+        return if session.is_empty() {
+            None
+        } else {
+            Some(session.to_string())
+        };
+    }
+    None
 }
 
 impl Tmux {
@@ -298,13 +328,14 @@ impl Tmux {
         cmd
     }
 
-    /// Take (and cache, inside an observation scope) the raw `pane_id\tpane_dead`
-    /// listing. Returns `None` when no scope is active or the snapshot is absent,
-    /// leaving the caller on its normal uncached path.
+    /// Take (and cache, inside an observation scope) the raw
+    /// `pane_id\tpane_dead\tsession_name` listing. Returns `None` when no scope
+    /// is active or the snapshot is absent, leaving the caller on its normal
+    /// uncached path.
     fn pane_dead_snapshot_uncached(&self) -> Option<String> {
         let output = self
             .cmd()
-            .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
+            .args(["list-panes", "-a", "-F", PANE_SNAPSHOT_FORMAT])
             .output()
             .ok()?;
         if !output.status.success() {
@@ -321,26 +352,8 @@ impl Tmux {
         if let Some(raw) = cached_pane_dead_snapshot(self) {
             return parse_pane_dead_flag(&raw, pane_id);
         }
-        let output = self
-            .cmd()
-            .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let mut parts = line.splitn(2, '\t');
-            let Some(id) = parts.next() else {
-                continue;
-            };
-            if id.trim() != pane_id {
-                continue;
-            }
-            let dead = parts.next().unwrap_or("0").trim();
-            return Some(dead == "1");
-        }
-        None
+        let raw = self.pane_dead_snapshot_uncached()?;
+        parse_pane_dead_flag(&raw, pane_id)
     }
 
     /// Check if a tmux pane is alive.
@@ -373,7 +386,7 @@ impl Tmux {
         }
         let out = self
             .cmd()
-            .args(["list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}"])
+            .args(["list-panes", "-a", "-F", PANE_SNAPSHOT_FORMAT])
             .output()
             .context("failed to sample tmux panes")?;
         if !out.status.success() {
@@ -382,20 +395,9 @@ impl Tmux {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        remember_pane_dead_snapshot(&String::from_utf8_lossy(&out.stdout));
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|line| {
-                let mut parts = line.splitn(2, '\t');
-                let pane_id = parts.next()?.trim();
-                let pane_dead = parts.next().unwrap_or("0").trim();
-                if pane_id.is_empty() || pane_dead == "1" {
-                    None
-                } else {
-                    Some(pane_id.to_string())
-                }
-            })
-            .collect())
+        let raw = String::from_utf8_lossy(&out.stdout);
+        remember_pane_dead_snapshot(&raw);
+        Ok(parse_alive_pane_ids(&raw))
     }
 
     /// Check if a tmux server is running (has any sessions).
@@ -748,7 +750,18 @@ impl Tmux {
     }
 
     /// Get the tmux session name that contains a pane or window.
+    ///
+    /// Inside an observation scope (`begin_pane_snapshot_scope`), the session is
+    /// read from the shared `list-panes -a` listing that liveness probes already
+    /// take, collapsing N per-pane `display-message` spawns to one listing
+    /// (`#panesessionsnapshot`). Outside a scope this stays a single
+    /// `display-message` per call.
     pub fn pane_session(&self, target: &str) -> Result<String> {
+        if let Some(raw) = cached_pane_dead_snapshot(self)
+            && let Some(session) = parse_pane_session(&raw, target)
+        {
+            return Ok(session);
+        }
         let output = self
             .cmd()
             .args(["display-message", "-t", target, "-p", "#{session_name}"])
@@ -2079,7 +2092,7 @@ mod tmux_tests {
 mod pane_snapshot_scope_tests {
     use super::*;
 
-    const RAW: &str = "%1\t0\n%2\t1\n%3\t0\n";
+    const RAW: &str = "%1\t0\tmain\n%2\t1\tstale\n%3\t0\tdev\n";
 
     #[test]
     fn parses_dead_flag_and_alive_set_from_one_snapshot() {
@@ -2091,6 +2104,22 @@ mod pane_snapshot_scope_tests {
         assert!(alive.contains("%1") && alive.contains("%3"));
         assert!(!alive.contains("%2"), "a dead pane is not alive");
         assert_eq!(alive.len(), 2);
+    }
+
+    #[test]
+    fn parses_session_name_from_the_shared_snapshot() {
+        assert_eq!(parse_pane_session(RAW, "%1"), Some("main".to_string()));
+        assert_eq!(parse_pane_session(RAW, "%3"), Some("dev".to_string()));
+        // a dead pane still carries its session; liveness and session are
+        // independent columns.
+        assert_eq!(parse_pane_session(RAW, "%2"), Some("stale".to_string()));
+        assert_eq!(parse_pane_session(RAW, "%missing"), None);
+        // an empty session column is "no answer", not "empty session" — the
+        // caller must fall back to its uncached probe.
+        assert_eq!(parse_pane_session("%9\t0\t\n", "%9"), None);
+        // legacy 2-column snapshots (no session column) still answer liveness
+        // but never invent a session.
+        assert_eq!(parse_pane_session("%1\t0\n", "%1"), None);
     }
 
     #[test]
@@ -2132,6 +2161,9 @@ mod pane_snapshot_scope_tests {
             assert_eq!(cached, RAW, "a lookup must not replace the snapshot");
             assert_eq!(parse_pane_dead_flag(&cached, "%1"), Some(false));
             assert_eq!(parse_pane_dead_flag(&cached, "%2"), Some(true));
+            // session-name lookups reuse the same listing (`#panesessionsnapshot`)
+            assert_eq!(parse_pane_session(&cached, "%1"), Some("main".to_string()));
+            assert_eq!(parse_pane_session(&cached, "%3"), Some("dev".to_string()));
         }
     }
 
