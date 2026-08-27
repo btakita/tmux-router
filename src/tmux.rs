@@ -419,6 +419,12 @@ impl Tmux {
         }
     }
 
+    /// Target a named tmux socket while retaining this handle's resolved client.
+    pub fn with_server_socket(mut self, server_socket: Option<String>) -> Self {
+        self.server_socket = server_socket;
+        self
+    }
+
     /// Exact executable used for every command spawned by this handle.
     pub fn binary_path(&self) -> &Path {
         &self.binary
