@@ -1046,6 +1046,7 @@ mod tests {
         save_registry(&reg_path, &registry).unwrap();
         let unavailable = Tmux {
             server_socket: Some(format!("tmux-router-missing-{}", std::process::id())),
+            ..Tmux::default_server()
         };
 
         assert!(prune(&reg_path, &unavailable).is_err());

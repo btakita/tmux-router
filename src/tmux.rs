@@ -135,16 +135,108 @@
 //!   future pane output into a file without using `capture-pane`.
 
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 const KITTY_RETURN_SEQUENCE: &str = "\x1b[13u";
 
 /// Tmux server handle — supports isolated `-L` servers for testing.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Tmux {
     /// If set, uses `-L <socket> -f /dev/null` for an isolated tmux server.
     pub server_socket: Option<String>,
+    /// Resolved tmux executable. Keeping this absolute whenever discovery
+    /// succeeds prevents GUI/IDE PATH skew from selecting a different client
+    /// than the terminal that owns the running server.
+    pub(crate) binary: PathBuf,
+}
+
+impl Default for Tmux {
+    fn default() -> Self {
+        Self {
+            server_socket: None,
+            binary: resolved_tmux_binary(),
+        }
+    }
+}
+
+static RESOLVED_TMUX_BINARY: OnceLock<PathBuf> = OnceLock::new();
+
+fn resolved_tmux_binary() -> PathBuf {
+    RESOLVED_TMUX_BINARY
+        .get_or_init(|| {
+            let override_path = std::env::var_os("TMUX_BIN").map(PathBuf::from);
+            resolve_tmux_binary_from(override_path, std::env::var_os("PATH"), |candidate| {
+                Command::new(candidate)
+                    .arg("-V")
+                    .output()
+                    .ok()
+                    .and_then(|output| {
+                        output
+                            .status
+                            .success()
+                            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                    })
+            })
+        })
+        .clone()
+}
+
+fn tmux_version_key(raw: &str) -> Option<(Vec<u32>, String)> {
+    let version = raw.strip_prefix("tmux ")?.trim();
+    let numeric_len = version
+        .char_indices()
+        .take_while(|(_, ch)| ch.is_ascii_digit() || *ch == '.')
+        .map(|(index, ch)| index + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let numbers = version[..numeric_len]
+        .split('.')
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    (!numbers.is_empty()).then(|| (numbers, version[numeric_len..].to_string()))
+}
+
+fn resolve_tmux_binary_from<F>(
+    override_path: Option<PathBuf>,
+    path: Option<std::ffi::OsString>,
+    mut version: F,
+) -> PathBuf
+where
+    F: FnMut(&Path) -> Option<String>,
+{
+    if let Some(explicit) = override_path {
+        return explicit;
+    }
+
+    let mut candidates = Vec::new();
+    if let Some(path) = path {
+        candidates.extend(std::env::split_paths(&path).map(|dir| dir.join("tmux")));
+    }
+    candidates.extend([
+        PathBuf::from("/usr/local/bin/tmux"),
+        PathBuf::from("/opt/homebrew/bin/tmux"),
+        PathBuf::from("/home/linuxbrew/.linuxbrew/bin/tmux"),
+        PathBuf::from("/usr/sbin/tmux"),
+        PathBuf::from("/usr/bin/tmux"),
+        PathBuf::from("/bin/tmux"),
+    ]);
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .filter_map(|candidate| {
+            let raw = version(&candidate)?;
+            let key = tmux_version_key(&raw)?;
+            Some((key, candidate))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, candidate)| candidate)
+        .unwrap_or_else(|| PathBuf::from("tmux"))
 }
 
 // `#syncobscache`: command-scoped pane-liveness snapshot.
@@ -319,9 +411,22 @@ impl Tmux {
         Tmux::default()
     }
 
+    /// Create a default-server handle using an explicitly configured client.
+    pub fn default_server_with_binary(binary: impl Into<PathBuf>) -> Self {
+        Self {
+            server_socket: None,
+            binary: binary.into(),
+        }
+    }
+
+    /// Exact executable used for every command spawned by this handle.
+    pub fn binary_path(&self) -> &Path {
+        &self.binary
+    }
+
     /// Build a tmux command with the appropriate `-L` and `-f` flags.
     pub fn cmd(&self) -> Command {
-        let mut cmd = Command::new("tmux");
+        let mut cmd = Command::new(&self.binary);
         if let Some(ref socket) = self.server_socket {
             cmd.args(["-L", socket, "-f", "/dev/null"]);
         }
@@ -1575,6 +1680,7 @@ impl IsolatedTmux {
         IsolatedTmux {
             tmux: Tmux {
                 server_socket: Some(name.to_string()),
+                binary: resolved_tmux_binary(),
             },
         }
     }
@@ -1752,9 +1858,39 @@ mod tmux_tests {
     }
 
     #[test]
+    fn resolver_prefers_newest_working_tmux_over_path_order() {
+        let path = std::env::join_paths(["/ide/old", "/terminal/new"]).unwrap();
+        let resolved = resolve_tmux_binary_from(None, Some(path), |candidate| {
+            match candidate.to_string_lossy().as_ref() {
+                "/ide/old/tmux" => Some("tmux 3.0a".to_string()),
+                "/terminal/new/tmux" => Some("tmux 3.10".to_string()),
+                _ => None,
+            }
+        });
+        assert_eq!(resolved, PathBuf::from("/terminal/new/tmux"));
+    }
+
+    #[test]
+    fn resolver_honors_explicit_tmux_binary_without_probing() {
+        let explicit = PathBuf::from("/configured/tmux");
+        let resolved = resolve_tmux_binary_from(Some(explicit.clone()), None, |_| {
+            panic!("an explicit tmux binary must not be probed during resolution")
+        });
+        assert_eq!(resolved, explicit);
+    }
+
+    #[test]
+    fn explicit_binary_is_used_by_spawn_command() {
+        let tmux = Tmux::default_server_with_binary("/configured/tmux");
+        assert_eq!(tmux.binary_path(), Path::new("/configured/tmux"));
+        assert_eq!(tmux.cmd().get_program(), "/configured/tmux");
+    }
+
+    #[test]
     fn fallible_alive_snapshot_distinguishes_tmux_failure_from_zero_panes() {
         let unavailable = Tmux {
             server_socket: Some(format!("tmux-router-missing-{}", std::process::id())),
+            binary: resolved_tmux_binary(),
         };
         assert!(unavailable.try_alive_pane_ids().is_err());
     }
