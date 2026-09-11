@@ -98,6 +98,25 @@ pub fn reconcile_selection_activates_window(passive: bool) -> bool {
     !passive
 }
 
+/// Whether a selection effect may activate the window its pane lives in, given
+/// that the pane is (or is not) parked in a `stash` window.
+///
+/// `#stashfocuswindow`: [`Tmux::select_pane`] batches `select-window -t <pane>`
+/// with `select-pane`, and tmux resolves the `-t` target to whatever window the
+/// pane lives in *right now*. A focus pane that is still stashed therefore drags
+/// the client into the stash window — the operator-reported "navigating to a
+/// document focuses the tmux stash window". A recorded window id cannot see this
+/// and a live one points straight at the stash, so stash *membership* is the
+/// predicate, not record-vs-live drift.
+///
+/// Surfacing a stashed pane belongs to the structural reconcile (its atomic
+/// swap / attach), which is why the selection effect degrades to the
+/// window-preserving form instead of refusing outright. [`restore_operator_focus`]
+/// already applies this rule; these are the remaining selection sites.
+pub fn selection_may_activate_window(passive: bool, pane_is_stashed: bool) -> bool {
+    reconcile_selection_activates_window(passive) && !pane_is_stashed
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconcileSelectionMode {
     Activate,
@@ -603,8 +622,23 @@ fn select_reconcile_pane(
     let target_window = tmux.pane_window(pane_id).ok();
     let target_window_is_active =
         before.as_ref().and_then(|focus| focus.window.as_ref()) == target_window.as_ref();
+    let pane_is_stashed = pane_in_stash_window(tmux, pane_id, session_name);
     match reconcile_selection_mode(passive, target_window_is_active) {
-        ReconcileSelectionMode::Activate => return tmux.select_pane(pane_id),
+        ReconcileSelectionMode::Activate => {
+            if selection_may_activate_window(passive, pane_is_stashed) {
+                return tmux.select_pane(pane_id);
+            }
+            // `#stashfocuswindow`: fall through to the window-preserving form so
+            // the stash window is never activated. The structural reconcile owns
+            // surfacing this pane.
+            log.log(
+                "SELECT",
+                format!(
+                    "pane {} is stashed; selected in place (not activating the stash window)",
+                    pane_id
+                ),
+            );
+        }
         ReconcileSelectionMode::PreserveVisiblePane => {
             log.log(
                 "SELECT",
@@ -1220,8 +1254,18 @@ pub fn sync_with_options(
             .list_window_panes(&target_window)
             .map(|panes| panes.iter().any(|p| p == fp))
             .unwrap_or(false);
+        // `#stashfocuswindow`: a focus pane the reconcile could not place is
+        // still in the stash, and `select_pane` would activate the stash window.
+        let focus_pane_is_stashed = pane_in_stash_window(tmux, fp, target_session.as_deref());
         if should_reselect_focus(options.passive, focus_pane_already_placed) {
-            tmux.select_pane(fp)?;
+            if selection_may_activate_window(options.passive, focus_pane_is_stashed) {
+                tmux.select_pane(fp)?;
+            } else {
+                eprintln!(
+                    "[sync] focus pane {fp} is stashed; selecting in place (not activating the stash window)"
+                );
+                tmux.select_pane_preserving_window(fp)?;
+            }
         } else {
             eprintln!(
                 "[sync] passive sync: leaving operator's active pane (document pane {fp} already placed)"
@@ -1982,6 +2026,71 @@ mod tests {
         assert!(should_reselect_focus(false, true));
         assert!(should_reselect_focus(false, false));
         assert!(reconcile_selection_activates_window(false));
+    }
+
+    /// `#stashfocuswindow`: an explicit sync still reselects the focus pane, but
+    /// never by activating the window it sits in when that window is the stash.
+    #[test]
+    fn an_explicit_selection_never_activates_a_stashed_panes_window() {
+        assert!(selection_may_activate_window(false, false));
+        assert!(!selection_may_activate_window(false, true));
+        // Passive was already window-neutral; stash membership cannot loosen it.
+        assert!(!selection_may_activate_window(true, false));
+        assert!(!selection_may_activate_window(true, true));
+    }
+
+    /// The operator-reported shape, against a live tmux server: the focus
+    /// document's pane is parked in the `stash` window while the operator is
+    /// looking at `agent-doc`. An explicit reconcile selection must update the
+    /// selection without dragging the client into the stash.
+    ///
+    /// The sensitivity half runs the pre-fix effect (a bare `select_pane`) on the
+    /// same pane and shows it *does* surface the stash, so the assertion above
+    /// cannot pass for the wrong reason.
+    #[test]
+    fn an_explicit_reconcile_selection_never_surfaces_the_stash_window() {
+        let iso = IsolatedTmux::new("tmux-stash-focus-window");
+        let cwd = Path::new("/tmp");
+        let session = "stashfocus";
+        let visible = iso.new_session(session, cwd).unwrap();
+        let visible_window = iso.pane_window(&visible).unwrap();
+        iso.raw_cmd(&["rename-window", "-t", &visible_window, "agent-doc"])
+            .unwrap();
+
+        let stashed = iso.new_window(session, cwd).unwrap();
+        iso.stash_pane(&stashed, session).unwrap();
+        let stash_window = iso.pane_window(&stashed).unwrap();
+        assert_ne!(
+            stash_window, visible_window,
+            "the focus pane must actually be parked in another window"
+        );
+        assert!(
+            iso.find_all_stash_windows(session).contains(&stash_window),
+            "the parked pane must be in a stash window, got {stash_window}"
+        );
+
+        iso.select_window(&visible_window).unwrap();
+        let mut log = SyncLog::new();
+        select_reconcile_pane(&iso, &stashed, Some(session), false, &mut log).unwrap();
+
+        assert_eq!(
+            iso.active_window(session).as_deref(),
+            Some(visible_window.as_str()),
+            "an explicit reconcile selection must not activate the stash window"
+        );
+        assert_eq!(
+            iso.selected_pane_in_window(&stash_window).as_deref(),
+            Some(stashed.as_str()),
+            "the selection still lands, it just does not activate the window"
+        );
+
+        // Sensitivity proof: the unguarded effect this replaced.
+        iso.select_pane(&stashed).unwrap();
+        assert_eq!(
+            iso.active_window(session).as_deref(),
+            Some(stash_window.as_str()),
+            "select_pane batches select-window, so the pre-fix call is what surfaced the stash"
+        );
     }
 
     // --- Layout parsing unit tests ---

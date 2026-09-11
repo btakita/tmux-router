@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **A selection effect never activates a `stash` window (`#stashfocuswindow`).**
+  `Tmux::select_pane` batches `select-window -t <pane>` with `select-pane`, and
+  tmux resolves that target to whatever window the pane lives in *now*. A focus
+  pane still parked in the stash therefore dragged the client into the stash
+  window — the reported "navigating to a document focuses the tmux stash
+  window". Neither a recorded window id (which still names the visible window)
+  nor a live one (which points straight at the stash) can decide this; stash
+  *membership* is the predicate. The reconcile SELECT step and the phase-6
+  focus reselect now degrade to `select_pane_preserving_window` for a stashed
+  pane, leaving surfacing to the structural reconcile's swap/attach.
+  `restore_operator_focus` already applied this rule; these were the remaining
+  selection sites.
+
 ## 0.3.20 (2026-07-29)
 
 - **Controller-proven pane bindings bypass document resolution.** A live

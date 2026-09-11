@@ -1300,7 +1300,7 @@ impl Tmux {
         }
     }
 
-    fn selected_pane_in_window(&self, window_id: &str) -> Option<String> {
+    pub(crate) fn selected_pane_in_window(&self, window_id: &str) -> Option<String> {
         self.raw_cmd(&["display-message", "-t", window_id, "-p", "#{pane_id}"])
             .ok()
             .map(|pane| pane.trim().to_string())
