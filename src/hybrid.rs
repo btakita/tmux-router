@@ -108,11 +108,13 @@ pub fn submit_text_for_harness(
     }
 }
 
+/// Harness-label normalization point. The match arms that once rewrote aliases
+/// are gone, so this is currently identity — kept as the single call site the
+/// backend lookups share, rather than scattering the concept when an alias
+/// comes back. `clippy::needless_match` flags the identity form, so it is
+/// written as a passthrough.
 fn normalize_harness(harness: &str) -> &str {
-    match harness {
-        "claude-code" => "claude-code",
-        other => other,
-    }
+    harness
 }
 
 /// Active `pipe-pane` stream. Dropping the guard disables the pane pipe.
