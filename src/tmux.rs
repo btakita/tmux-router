@@ -860,6 +860,44 @@ impl Tmux {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// Get both the window id and the window NAME containing a pane, in one
+    /// query.
+    ///
+    /// Callers that decide whether a pane is somewhere the operator can see need
+    /// both halves: the id answers "is it in the expected window", the name
+    /// answers "is it parked in a stash window". Taking them separately costs a
+    /// second `display-message` and, worse, lets the two observations disagree
+    /// across a concurrent `move-window`.
+    ///
+    /// Window names may contain spaces, so the id is split off at the FIRST
+    /// space and the remainder is the name verbatim.
+    pub fn pane_window_identity(&self, pane_id: &str) -> Result<(String, String)> {
+        let output = self
+            .cmd()
+            .args([
+                "display-message",
+                "-t",
+                pane_id,
+                "-p",
+                "#{window_id} #{window_name}",
+            ])
+            .output()
+            .context("failed to run tmux display-message")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "tmux display-message failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        match line.split_once(' ') {
+            Some((window_id, window_name)) => {
+                Ok((window_id.trim().to_string(), window_name.trim().to_string()))
+            }
+            None => Ok((line, String::new())),
+        }
+    }
+
     /// Get the tmux session name that contains a pane or window.
     ///
     /// Inside an observation scope (`begin_pane_snapshot_scope`), the session is
