@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::tmux::Tmux;
 
@@ -435,15 +435,6 @@ pub fn prune(registry_path: &Path, tmux: &Tmux) -> Result<usize> {
         save_registry(registry_path, &registry)?;
     }
     Ok(total)
-}
-
-fn timestamp_secs() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .try_into()
-        .unwrap_or(i64::MAX)
 }
 
 fn open_sqlite_registry(path: &Path) -> Result<Connection> {
