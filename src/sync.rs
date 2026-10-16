@@ -27,6 +27,16 @@
 //! - A 1-in/1-out replacement uses an atomic `swap-pane` fast path to avoid
 //!   visual flicker unless the incoming pane is currently parked in a stash
 //!   window; stash-origin panes reattach through the normal attach/detach path.
+//!   `swap-pane` puts the incoming pane in the outgoing pane's cell, so the
+//!   swap is followed by the order post-condition like every other path.
+//! - **Order post-condition** (`#tmuxpanesreversed`): every reconcile that
+//!   mutated the target window ends in `enforce_order_postcondition`, which
+//!   re-reads tmux geometry (`#{pane_left}`, `#{pane_top}`) — never pane
+//!   indices, whose numbering depends on `pane-base-index` and which
+//!   `swap-pane` permutes — reorders when the wanted panes are present in the
+//!   wrong order, and logs a `VERIFY` error when the final left-to-right,
+//!   top-to-bottom order still differs from the desired column-major order.
+//!   No path returns success for an order it did not observe.
 //! - After layout stabilises, `equalize_sizes` distributes pane space evenly
 //!   (50/50 for 2 columns, `even-horizontal` for 3+, percentage-split per column).
 //! - `stash_overflow_panes` removes trailing panes (column-last, non-focus) when
@@ -67,6 +77,12 @@
 //!
 //! - `fast_path`: layout already matches desired order → zero mutations, returns immediately
 //! - `swap_atomic`: exactly one pane in, one pane out → `swap-pane` used, no join/stash cycle
+//! - `swap_then_order`: a 1-in/1-out swap that leaves the incoming pane on the
+//!   wrong side (`[X, A]` → desired `[A, B]`) is reordered before returning
+//! - `pane_order_invariant_*`: exhaustive over every start arrangement of a
+//!   3-pane pool and every desired order of width 1-3, with outsiders in plain
+//!   windows or the stash, and with zero- and one-based `base-index` /
+//!   `pane-base-index` → final geometry equals the desired order
 //! - `stash_origin_no_swap`: stashed incoming pane skips `swap-pane` and reattaches by join/stash
 //! - `attach_detach_order`: missing panes joined before unwanted panes stashed → focus pane never loses selection during stash
 //! - `reorder`: correct panes present but wrong order → break + rejoin restores desired order
@@ -1373,6 +1389,17 @@ pub fn reconcile(
         log.log("FAST_PATH", "layout already correct");
         return Ok(log);
     }
+    // `#tmuxpanesreversed`: a mutating pass records the host facts that could
+    // change placement (tmux version, index bases) and the geometry it started
+    // from, so a host-specific misorder is diagnosable from the log alone.
+    log.log(
+        "GEOMETRY",
+        format!(
+            "before {} {}",
+            tmux.layout_environment(),
+            crate::tmux::render_geometry(&tmux.pane_geometry(target_window).unwrap_or_default())
+        ),
+    );
 
     // `#panefocussteal`: a passive editor-driven reconcile must be focus-neutral.
     // The attach/detach/reorder phases below select panes (and re-select the
@@ -1450,6 +1477,25 @@ pub fn reconcile(
                         update_registry(tmux, outgoing, registry_path, &mut log);
 
                         let select_target = focus_pane.unwrap_or(first_pane);
+                        // `#tmuxpanesreversed`: `swap-pane` puts the incoming
+                        // pane in the OUTGOING pane's cell. That is the desired
+                        // order only when the desired layout also replaces the
+                        // outgoing pane in place; `[X, A]` → `[A, B]` swaps to
+                        // `[B, A]`. The swap therefore never ends the reconcile
+                        // on its own: the order post-condition below re-reads
+                        // geometry and reorders whenever the swap left the
+                        // panes in the wrong order.
+                        enforce_order_postcondition(
+                            tmux,
+                            target_window,
+                            pane_columns,
+                            desired_ordered,
+                            &wanted,
+                            select_target,
+                            session_name,
+                            options,
+                            &mut log,
+                        );
                         let _ = select_reconcile_pane(
                             tmux,
                             select_target,
@@ -1692,12 +1738,66 @@ pub fn reconcile(
         .unwrap_or_default();
     log.log("DETACH", format!("done — selected={}", sel));
 
-    // --- REORDER if needed ---
+    // --- REORDER if needed, then VERIFY (the order post-condition) ---
+    enforce_order_postcondition(
+        tmux,
+        target_window,
+        pane_columns,
+        desired_ordered,
+        &wanted,
+        select_target,
+        session_name,
+        options,
+        &mut log,
+    );
+
+    // --- POST-CONDITION: session boundary invariant ---
+    // Every pane in the target window must belong to the scoped session.
+    // This catches any code path that bypassed SessionScope guards.
+    scope.verify_boundary(target_window, &mut log);
+
+    // --- REGISTRY UPDATE for all wanted panes ---
+    for pane in desired_ordered {
+        update_registry(tmux, pane, registry_path, &mut log);
+    }
+
+    // `#panefocussteal`: undo the internal SELECT/DETACH-restore churn for a
+    // passive sync so the operator stays on whatever pane/window they were using.
+    restore_operator_focus(tmux, session_name, &operator_focus_restore, &mut log);
+
+    Ok(log)
+}
+
+/// The pane-order post-condition of [`reconcile`] (`#tmuxpanesreversed`).
+///
+/// Re-reads the target window's geometry (`#{pane_left}`, `#{pane_top}`, via
+/// [`Tmux::list_panes_ordered`]) — never tmux pane indices, whose numbering
+/// depends on `pane-base-index` and which `swap-pane` also permutes — and,
+/// when the window holds exactly the wanted panes in another order, breaks
+/// every non-anchor pane and rejoins them in column-major order. It then
+/// verifies once more and logs a `VERIFY` error (never a silent success) when
+/// the final geometry still differs from `desired_ordered`.
+///
+/// Every reconcile path that mutated the window ends here, so no fast path
+/// can report success for an order it did not produce.
+#[allow(clippy::too_many_arguments)]
+fn enforce_order_postcondition(
+    tmux: &Tmux,
+    target_window: &str,
+    pane_columns: &[Vec<String>],
+    desired_ordered: &[&str],
+    wanted: &HashSet<&str>,
+    select_target: &str,
+    session_name: Option<&str>,
+    options: &SyncOptions,
+    log: &mut SyncLog,
+) {
+    let first_pane = desired_ordered[0];
     let current_order = tmux.list_panes_ordered(target_window).unwrap_or_default();
     let current_order_refs: Vec<&str> = current_order.iter().map(|s| s.as_str()).collect();
     let final_set: HashSet<&str> = current_order_refs.iter().copied().collect();
 
-    if final_set == wanted && current_order_refs != desired_ordered {
+    if final_set == *wanted && current_order_refs != desired_ordered {
         log.log(
             "REORDER",
             format!(
@@ -1730,11 +1830,19 @@ pub fn reconcile(
             }
         }
         // Re-select focus after reorder
-        let _ = select_reconcile_pane(tmux, select_target, session_name, options.passive, &mut log);
+        let _ = select_reconcile_pane(tmux, select_target, session_name, options.passive, log);
     }
 
     // --- VERIFY ---
-    let final_state = tmux.list_panes_ordered(target_window).unwrap_or_default();
+    let final_geometry = tmux.pane_geometry(target_window).unwrap_or_default();
+    log.log(
+        "GEOMETRY",
+        format!("after {}", crate::tmux::render_geometry(&final_geometry)),
+    );
+    let final_state: Vec<String> = final_geometry
+        .into_iter()
+        .map(|pane| pane.pane_id)
+        .collect();
     let final_refs: Vec<&str> = final_state.iter().map(|s| s.as_str()).collect();
     if final_refs == desired_ordered {
         log.log("VERIFY", "layout correct");
@@ -1773,22 +1881,6 @@ pub fn reconcile(
             );
         }
     }
-
-    // --- POST-CONDITION: session boundary invariant ---
-    // Every pane in the target window must belong to the scoped session.
-    // This catches any code path that bypassed SessionScope guards.
-    scope.verify_boundary(target_window, &mut log);
-
-    // --- REGISTRY UPDATE for all wanted panes ---
-    for pane in desired_ordered {
-        update_registry(tmux, pane, registry_path, &mut log);
-    }
-
-    // `#panefocussteal`: undo the internal SELECT/DETACH-restore churn for a
-    // passive sync so the operator stays on whatever pane/window they were using.
-    restore_operator_focus(tmux, session_name, &operator_focus_restore, &mut log);
-
-    Ok(log)
 }
 
 /// Determine the join flag when the first desired pane (anchor) needs to join
@@ -6448,5 +6540,173 @@ mod tests {
         assert!(final_panes.contains(&pane_local));
         assert!(final_panes.contains(&pane_foreign));
         assert!(!final_panes.contains(&pane_spare));
+    }
+
+    // --- Pane-order invariant (#tmuxpanesreversed) --------------------------
+    //
+    // Post-condition of `reconcile`: whenever every desired pane is alive and
+    // the scope allows the moves, the target window's panes, read back from
+    // tmux geometry (`#{pane_left}`, `#{pane_top}`), are exactly the desired
+    // column-major order. Checked exhaustively over every start arrangement
+    // (any ordered subset of a 3-pane pool already laid out left to right in
+    // the target window) and every desired order of the given width, with the
+    // outsiders either in ordinary windows (the atomic swap fast path is
+    // eligible) or in the stash window, and with tmux's default and
+    // one-based window/pane indices.
+
+    fn ordered_subsets(pool: &[String], len: usize) -> Vec<Vec<String>> {
+        if len == 0 {
+            return vec![Vec::new()];
+        }
+        let mut out = Vec::new();
+        for (index, pane) in pool.iter().enumerate() {
+            let mut rest = pool.to_vec();
+            rest.remove(index);
+            for mut tail in ordered_subsets(&rest, len - 1) {
+                tail.insert(0, pane.clone());
+                out.push(tail);
+            }
+        }
+        out
+    }
+
+    /// Kill a test session and SIGKILL its pane processes. On tmux 3.7c a
+    /// pane child of a detached isolated server can sit pre-exec with every
+    /// signal but SIGKILL blocked, and it outlives `kill-session` /
+    /// `kill-server` holding a pty; an exhaustive run would otherwise strand
+    /// hundreds of them on the host.
+    fn reap_session_panes(t: &IsolatedTmux, session: &str) {
+        let pids = t
+            .raw_cmd(&["list-panes", "-s", "-t", session, "-F", "#{pane_pid}"])
+            .unwrap_or_default();
+        let _ = t.raw_cmd(&["kill-session", "-t", session]);
+        for pid in pids.split_whitespace() {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+
+    fn assert_reconcile_realises_every_order(
+        label: &str,
+        desired_len: usize,
+        stash_outsiders: bool,
+        one_based: bool,
+    ) {
+        // ONE isolated server per property; every case gets its own session
+        // and kills it afterwards, so a run never fans out into hundreds of
+        // tmux servers (each pane spawns a process and holds a pty).
+        let t = IsolatedTmux::new(&format!("ord-{label}-{}", std::process::id()));
+        let tmp = TempDir::new().unwrap();
+        t.new_session("bootstrap", tmp.path()).unwrap();
+        let _ = t.raw_cmd(&["set-option", "-g", "default-command", "exec sleep 600"]);
+        if one_based {
+            let _ = t.raw_cmd(&["set-option", "-g", "base-index", "1"]);
+            let _ = t.raw_cmd(&["set-option", "-g", "pane-base-index", "1"]);
+        }
+        let pool_size = 3;
+        let indices: Vec<String> = (0..pool_size).map(|i| i.to_string()).collect();
+        let mut failures = Vec::new();
+        let mut case = 0usize;
+        for start_len in 1..=pool_size {
+            for start in ordered_subsets(&indices, start_len) {
+                for desired in ordered_subsets(&indices, desired_len) {
+                    case += 1;
+                    let session = format!("c{case}");
+                    let first = t.new_session(&session, tmp.path()).unwrap();
+                    let _ = t.raw_cmd(&["resize-window", "-t", &first, "-x", "200", "-y", "60"]);
+                    let mut pool = vec![first];
+                    for _ in 1..pool_size {
+                        pool.push(t.new_window(&session, tmp.path()).unwrap());
+                    }
+                    let pane = |index: &String| pool[index.parse::<usize>().unwrap()].clone();
+                    let start_panes: Vec<String> = start.iter().map(pane).collect();
+                    for pair in start_panes.windows(2) {
+                        t.join_pane(&pair[1], &pair[0], "-dh").unwrap();
+                    }
+                    let target_window = t.pane_window(&start_panes[0]).unwrap();
+                    if stash_outsiders {
+                        for outsider in pool.iter().filter(|p| !start_panes.contains(p)) {
+                            t.stash_pane(outsider, &session).unwrap();
+                        }
+                    }
+                    let before = t.list_panes_ordered(&target_window).unwrap();
+                    assert_eq!(before, start_panes, "{label} case {case}: start layout");
+
+                    let desired_panes: Vec<String> = desired.iter().map(pane).collect();
+                    let pane_columns: Vec<Vec<String>> =
+                        desired_panes.iter().map(|p| vec![p.clone()]).collect();
+                    let desired_refs: Vec<&str> =
+                        desired_panes.iter().map(String::as_str).collect();
+                    let log = reconcile(
+                        &t,
+                        &target_window,
+                        &pane_columns,
+                        &desired_refs,
+                        Some(&session),
+                        Some(desired_refs[0]),
+                        &dummy_registry_path(),
+                        &SyncOptions::default(),
+                    )
+                    .unwrap();
+                    let after = t.list_panes_ordered(&target_window).unwrap();
+                    let order_errors: Vec<&String> = log
+                        .entries()
+                        .iter()
+                        .filter(|e| !e.ok && e.phase != "REGISTRY")
+                        .map(|e| &e.message)
+                        .collect();
+                    if after != desired_panes || !order_errors.is_empty() {
+                        failures.push(format!(
+                            "start={start:?} desired={desired:?} after_ids={after:?} desired_ids={desired_panes:?} errors={order_errors:?}"
+                        ));
+                    }
+                    reap_session_panes(&t, &session);
+                }
+            }
+        }
+        reap_session_panes(&t, "bootstrap");
+        assert!(
+            failures.is_empty(),
+            "{label}: {} of {case} reconciles violated the pane-order post-condition:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn pane_order_invariant_width_1_every_start() {
+        assert_reconcile_realises_every_order("w1", 1, false, false);
+    }
+
+    #[test]
+    fn pane_order_invariant_width_2_every_start() {
+        assert_reconcile_realises_every_order("w2", 2, false, false);
+    }
+
+    #[test]
+    fn pane_order_invariant_width_3_every_start() {
+        assert_reconcile_realises_every_order("w3", 3, false, false);
+    }
+
+    #[test]
+    fn pane_order_invariant_width_2_stashed_outsiders() {
+        assert_reconcile_realises_every_order("w2s", 2, true, false);
+    }
+
+    #[test]
+    fn pane_order_invariant_width_3_stashed_outsiders() {
+        assert_reconcile_realises_every_order("w3s", 3, true, false);
+    }
+
+    #[test]
+    fn pane_order_invariant_width_2_one_based_indices() {
+        assert_reconcile_realises_every_order("w2b", 2, false, true);
+    }
+
+    #[test]
+    fn pane_order_invariant_width_3_one_based_indices() {
+        assert_reconcile_realises_every_order("w3b", 3, true, true);
     }
 }

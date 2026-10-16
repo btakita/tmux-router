@@ -993,6 +993,53 @@ impl Tmux {
         Ok(panes)
     }
 
+    /// Each pane's id and geometry in a window, sorted by position
+    /// (left-to-right, then top-to-bottom). Includes `#{pane_index}` only for
+    /// diagnostics: order is decided by geometry, never by the index, whose
+    /// numbering depends on `pane-base-index` (`#tmuxpanesreversed`).
+    pub fn pane_geometry(&self, window_id: &str) -> Result<Vec<PaneGeometry>> {
+        let output = self
+            .cmd()
+            .args([
+                "list-panes",
+                "-t",
+                window_id,
+                "-F",
+                "#{pane_id} #{pane_left} #{pane_top} #{pane_index}",
+            ])
+            .output()
+            .context("failed to run tmux list-panes")?;
+        if !output.status.success() {
+            anyhow::bail!("tmux list-panes failed for window {}", window_id);
+        }
+        let mut panes: Vec<PaneGeometry> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                (parts.len() >= 4).then(|| PaneGeometry {
+                    pane_id: parts[0].to_string(),
+                    left: parts[1].parse::<u32>().unwrap_or(0),
+                    top: parts[2].parse::<u32>().unwrap_or(0),
+                    index: parts[3].parse::<u32>().unwrap_or(0),
+                })
+            })
+            .collect();
+        panes.sort_by_key(|pane| (pane.left, pane.top));
+        Ok(panes)
+    }
+
+    /// The tmux facts that could make pane placement differ between hosts:
+    /// server version and the window/pane index bases. Diagnostic only.
+    pub fn layout_environment(&self) -> String {
+        let read = |args: &[&str]| self.raw_cmd(args).unwrap_or_else(|_| "?".to_string());
+        format!(
+            "tmux_version={} base_index={} pane_base_index={}",
+            read(&["display-message", "-p", "#{version}"]),
+            read(&["show-options", "-gv", "base-index"]),
+            read(&["show-options", "-gwv", "pane-base-index"]),
+        )
+    }
+
     /// List panes in a window sorted by position (left-to-right, top-to-bottom).
     pub fn list_panes_ordered(&self, window_id: &str) -> Result<Vec<String>> {
         let output = self
@@ -1715,6 +1762,32 @@ fn send_keys_kitty_return_submit_command(pane_id: &str, text: &str) -> Vec<Strin
 }
 
 /// RAII guard that kills the isolated tmux server on drop.
+/// One pane's position in its window (`#tmuxpanesreversed` diagnostics).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneGeometry {
+    pub pane_id: String,
+    pub left: u32,
+    pub top: u32,
+    /// `#{pane_index}` — diagnostic only; never an order input.
+    pub index: u32,
+}
+
+impl std::fmt::Display for PaneGeometry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}@{},{}#{}",
+            self.pane_id, self.left, self.top, self.index
+        )
+    }
+}
+
+/// Render geometry as `[%1@0,0#0 %2@101,0#1]` for one log line.
+pub fn render_geometry(panes: &[PaneGeometry]) -> String {
+    let parts: Vec<String> = panes.iter().map(ToString::to_string).collect();
+    format!("[{}]", parts.join(" "))
+}
+
 pub struct IsolatedTmux {
     tmux: Tmux,
 }

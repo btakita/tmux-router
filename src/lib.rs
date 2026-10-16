@@ -18,6 +18,6 @@ pub use registry::{
 };
 pub use sync::{FileResolution, SyncOptions, SyncResult, sync, sync_with_options};
 pub use tmux::{
-    IsolatedTmux, PaneSnapshotScope, Tmux, TmuxBatch, begin_pane_snapshot_scope,
+    IsolatedTmux, PaneGeometry, PaneSnapshotScope, Tmux, TmuxBatch, begin_pane_snapshot_scope,
     invalidate_pane_snapshot,
 };
