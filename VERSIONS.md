@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Every `RegistryLock` acquisition waits a bounded, named time (`#tmuxrouterboundedlock`).**
+  `RegistryLock::acquire` blocked in `flock` with no limit, and so did the
+  acquisitions tmux-router takes itself (`with_registry`, `with_registry_val`,
+  `update_window_for_entry`, `prune`). A caller queued behind a holder that
+  never let go hung silently. Acquisition now polls a non-blocking lock on the
+  guard's own file descriptor until it succeeds or the bound passes, so the
+  attempt that succeeds is the acquisition (no free-to-taken gap a probe-then-
+  lock wrapper had), and gives up with a typed `RegistryLockWaitExceeded` that
+  names the lock file, the purpose, the time waited and the holder's pid and
+  command line (`/proc/locks` on Linux). New API: `RegistryLock::acquire_for`
+  (named purpose), `RegistryLock::acquire_with` (explicit `RegistryLockWait`
+  bound + heartbeat called about once a second while waiting),
+  `set_registry_lock_wait` / `registry_lock_wait` (process-wide policy used by
+  `acquire` and every internal acquisition; default 30s, no heartbeat),
+  `registry_lock_file_path`, `registry_lock_acquisitions_on_this_thread`,
+  `registry_lock_held_on_this_thread`, `flock_holder_pids`. The lock lives in
+  the new `registry_lock` module and is re-exported from `registry` and the
+  crate root.
+
 - **A selection effect never activates a `stash` window (`#stashfocuswindow`).**
   `Tmux::select_pane` batches `select-window -t <pane>` with `select-pane`, and
   tmux resolves that target to whatever window the pane lives in *now*. A focus

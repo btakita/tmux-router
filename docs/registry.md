@@ -35,3 +35,31 @@ let pane = registry::lookup(path, "my-session")?;
 let tmux = tmux_router::Tmux::default_server();
 let pruned = registry::prune_dead(&registry, &tmux);
 ```
+
+## Locking
+
+Read-modify-write helpers (`with_registry`, `with_registry_val`,
+`update_window_for_entry`, `prune`) hold an exclusive advisory lock on
+`<registry>.lock` for the whole operation. Take it yourself with
+`RegistryLock`:
+
+```rust
+use tmux_router::registry::{RegistryLock, RegistryLockWait, set_registry_lock_wait};
+use std::time::Duration;
+
+// Process-wide policy for every acquisition that does not pass its own,
+// including the helpers above. Default: 30s, no heartbeat.
+set_registry_lock_wait(RegistryLockWait {
+    bound: Duration::from_secs(10),
+    heartbeat: Some(|| eprintln!("still waiting for the registry lock")),
+});
+
+let _lock = RegistryLock::acquire_for(path, "rename a session")?;
+```
+
+An acquisition never waits past its bound. It polls a non-blocking lock on the
+guard's own file, so the attempt that succeeds is the acquisition, and it fails
+with `RegistryLockWaitExceeded` naming the lock file, the purpose, the time
+waited and the holder (pid and command line, on Linux). The lock is not
+reentrant: a nested acquisition on the same thread fails instead of
+deadlocking (`acquire_or_skip` returns `None` instead).

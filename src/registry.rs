@@ -4,12 +4,9 @@
 //! hardcoding any particular registry location.
 
 use anyhow::{Context, Result};
-use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::cell::Cell;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -18,85 +15,12 @@ use crate::tmux::Tmux;
 const STATE_DB_FILE: &str = "state.db";
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Thread-local flag to detect nested lock acquisition (flock is not reentrant).
-thread_local! {
-    static REGISTRY_LOCK_HELD: Cell<bool> = const { Cell::new(false) };
-}
-
-// ---------------------------------------------------------------------------
-// Advisory file lock (flock on Unix, LockFileEx on Windows via fs2)
-// ---------------------------------------------------------------------------
-
-/// RAII guard for exclusive advisory lock on the registry file.
-///
-/// Acquire via `RegistryLock::acquire(registry_path)`. The lock file is
-/// `<registry_path>.lock` (sibling file). The lock is released when the
-/// guard is dropped.
-#[derive(Debug)]
-pub struct RegistryLock {
-    _file: File,
-    _path: PathBuf,
-}
-
-impl RegistryLock {
-    /// Acquire an exclusive advisory lock. Blocks until the lock is available.
-    ///
-    /// If the current thread already holds a `RegistryLock`, returns `None`
-    /// with a warning instead of deadlocking (flock is not reentrant on Linux).
-    /// Use `acquire_or_skip()` when the caller can tolerate a no-op.
-    pub fn acquire(registry_path: &Path) -> Result<Self> {
-        if REGISTRY_LOCK_HELD.get() {
-            anyhow::bail!(
-                "RegistryLock already held on this thread — would deadlock on {}",
-                registry_path.display()
-            );
-        }
-        let lock_path = if is_sqlite_registry_path(registry_path) {
-            registry_path.with_extension("db.lock")
-        } else {
-            registry_path.with_extension("json.lock")
-        };
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
-        file.lock_exclusive()
-            .with_context(|| format!("failed to acquire lock on {}", lock_path.display()))?;
-        REGISTRY_LOCK_HELD.set(true);
-        Ok(Self {
-            _file: file,
-            _path: lock_path,
-        })
-    }
-
-    /// Try to acquire the lock; if the current thread already holds it, return
-    /// `Ok(None)` with a warning instead of deadlocking. Callers should treat
-    /// `None` as "skip the locked operation."
-    pub fn acquire_or_skip(registry_path: &Path) -> Result<Option<Self>> {
-        if REGISTRY_LOCK_HELD.get() {
-            eprintln!(
-                "[registry] warning: RegistryLock already held on this thread, skipping nested lock for {}",
-                registry_path.display()
-            );
-            return Ok(None);
-        }
-        Ok(Some(Self::acquire(registry_path)?))
-    }
-}
-
-impl Drop for RegistryLock {
-    fn drop(&mut self) {
-        // fs2 releases the lock when the file is closed (on drop),
-        // but explicit unlock is cleaner.
-        let _ = self._file.unlock();
-        REGISTRY_LOCK_HELD.set(false);
-    }
-}
+pub use crate::registry_lock::{
+    DEFAULT_REGISTRY_LOCK_PURPOSE, DEFAULT_REGISTRY_LOCK_WAIT, RegistryLock, RegistryLockWait,
+    RegistryLockWaitExceeded, flock_holder_pids, registry_lock_acquisitions_on_this_thread,
+    registry_lock_file_path, registry_lock_held_on_this_thread, registry_lock_wait,
+    set_registry_lock_wait,
+};
 
 /// Execute a read-modify-write operation on the registry under an exclusive lock.
 ///
@@ -153,7 +77,7 @@ pub fn sqlite_registry_path_in(base_dir: &Path) -> PathBuf {
     base_dir.join(".agent-doc").join(STATE_DB_FILE)
 }
 
-fn is_sqlite_registry_path(path: &Path) -> bool {
+pub(crate) fn is_sqlite_registry_path(path: &Path) -> bool {
     path.file_name().and_then(|name| name.to_str()) == Some(STATE_DB_FILE)
         || matches!(
             path.extension().and_then(|extension| extension.to_str()),
@@ -293,7 +217,7 @@ pub fn update_window_for_entry(
     if is_sqlite_registry_path(registry_path) {
         return update_sqlite_window_for_entry(registry_path, pane_id, new_window);
     }
-    let _lock = RegistryLock::acquire(registry_path)?;
+    let _lock = RegistryLock::acquire_for(registry_path, "update a pane's window")?;
     let mut registry = load_registry(registry_path)?;
     let mut changed = false;
     for entry in registry.values_mut() {

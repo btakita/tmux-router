@@ -4,6 +4,7 @@ pub mod control;
 pub mod hybrid;
 pub mod pane_policy;
 pub mod registry;
+pub mod registry_lock;
 pub mod sync;
 pub mod tmux;
 
@@ -14,7 +15,8 @@ pub use hybrid::{
 };
 pub use pane_policy::PaneMoveOp;
 pub use registry::{
-    Registry, RegistryEntry, RegistryLock, prune, with_registry, with_registry_val,
+    Registry, RegistryEntry, RegistryLock, RegistryLockWait, RegistryLockWaitExceeded, prune,
+    with_registry, with_registry_val,
 };
 pub use sync::{FileResolution, SyncOptions, SyncResult, sync, sync_with_options};
 pub use tmux::{
