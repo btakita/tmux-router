@@ -1,6 +1,6 @@
 # Versions
 
-## Unreleased
+## 0.3.23 (2026-11-05)
 
 - **Every `RegistryLock` acquisition waits a bounded, named time (`#tmuxrouterboundedlock`).**
   `RegistryLock::acquire` blocked in `flock` with no limit, and so did the

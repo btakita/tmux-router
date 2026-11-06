@@ -1,4 +1,4 @@
-<!-- tsift:code-navigation v=0.1.103 -->
+<!-- tsift:code-navigation v=0.1.109 -->
 ## Code Navigation
 
 Use the repository tsift skill at [`.agents/skills/tsift/SKILL.md`](.agents/skills/tsift/SKILL.md) for code search, source reading, call graphs, diffs, logs, and test output.
