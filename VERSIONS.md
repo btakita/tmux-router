@@ -1,5 +1,9 @@
 # Versions
 
+## 0.3.24 (2026-11-06)
+
+- **The Release workflow can create the GitHub Release (`#tmuxrouterreleaseperms`).** The publish job grants `contents: write`, so Create GitHub Release is not rejected with HTTP 403 on a tag that contains this workflow.
+
 ## 0.3.23 (2026-11-05)
 
 - **Every `RegistryLock` acquisition waits a bounded, named time (`#tmuxrouterboundedlock`).**
